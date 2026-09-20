@@ -9,6 +9,7 @@ name = "bikebridge"
 path = "src/main.rs"
 
 [dependencies]
+bikebridge-trace.workspace = true
 bikebridge-core.workspace = true
 bikebridge-ble.workspace = true
 bikebridge-server.workspace = true

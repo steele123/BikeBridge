@@ -8,6 +8,8 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+bikebridge-openbikecontrol = { path = "crates/bikebridge-openbikecontrol" }
+bikebridge-trace = { path = "crates/bikebridge-trace" }
 bikebridge-core = { path = "crates/bikebridge-core" }
 bikebridge-ble = { path = "crates/bikebridge-ble" }
 bikebridge-mock = { path = "crates/bikebridge-mock" }

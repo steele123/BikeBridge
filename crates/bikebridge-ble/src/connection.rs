@@ -1,9 +1,11 @@
 use crate::{
-    ftms::{RecordAssembler, decode_features},
-    transport::{FtmsSession, FtmsTransport},
+    ftms::decode_features,
+    session::{ActiveSession, SessionEvent},
+    transport::FtmsTransport,
 };
-use bikebridge_core::{BridgeError, DeviceInfo, ErrorCode, Event, EventBus, Result, timestamp_ms};
-use futures_util::StreamExt;
+use bikebridge_core::{
+    BridgeError, DeviceInfo, ErrorCode, Event, EventBus, Result, SafetyLimits, TrainerCommand,
+};
 use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -18,20 +20,37 @@ pub(crate) struct Connections {
     bus: EventBus,
     stop: CancellationToken,
     tasks: TaskTracker,
+    limits: SafetyLimits,
+    leases: Arc<RwLock<HashMap<usize, CancellationToken>>>,
 }
 struct Entry {
     info: Arc<RwLock<DeviceInfo>>,
     transport: Arc<dyn FtmsTransport>,
     commands: Option<mpsc::Sender<Request>>,
 }
-struct Request {
-    connected: bool,
-    reply: oneshot::Sender<Result<DeviceInfo>>,
+enum Request {
+    Connection {
+        client: usize,
+        connected: bool,
+        reply: oneshot::Sender<Result<DeviceInfo>>,
+    },
+    Control {
+        client: usize,
+        lease: CancellationToken,
+        command: TrainerCommand,
+        reply: oneshot::Sender<Result<TrainerCommand>>,
+    },
 }
 
 impl Connections {
+    #[cfg(test)]
     pub fn new(bus: EventBus) -> Self {
+        Self::with_limits(bus, SafetyLimits::default())
+    }
+    pub fn with_limits(bus: EventBus, limits: SafetyLimits) -> Self {
         Self {
+            limits,
+            leases: Arc::default(),
             entries: Arc::default(),
             bus,
             stop: CancellationToken::new(),
@@ -76,7 +95,16 @@ impl Connections {
             self.bus.publish(event);
         }
     }
+    #[cfg(test)]
     pub async fn set_connection(&self, id: &str, connected: bool) -> Result<DeviceInfo> {
+        self.set_connection_for(0, id, connected).await
+    }
+    pub async fn set_connection_for(
+        &self,
+        client: usize,
+        id: &str,
+        connected: bool,
+    ) -> Result<DeviceInfo> {
         let (reply, response) = oneshot::channel();
         {
             let mut entries = self.entries.write().await;
@@ -86,7 +114,7 @@ impl Connections {
             let entry = entries.get_mut(id).ok_or_else(|| {
                 BridgeError::new(
                     ErrorCode::UnsupportedOperation,
-                    "Only discovered FTMS indoor bikes can connect in Phase 3.",
+                    "Only discovered FTMS indoor bikes can connect.",
                 )
             })?;
             if entry.commands.is_none() {
@@ -95,11 +123,14 @@ impl Connections {
                 }
                 let (commands, requests) = mpsc::channel(4);
                 self.tasks.spawn(run(
-                    entry.transport.clone(),
-                    entry.info.clone(),
+                    WorkerContext {
+                        transport: entry.transport.clone(),
+                        info: entry.info.clone(),
+                        bus: self.bus.clone(),
+                        stop: self.stop.clone(),
+                        limits: self.limits,
+                    },
                     requests,
-                    self.bus.clone(),
-                    self.stop.clone(),
                 ));
                 entry.commands = Some(commands);
             }
@@ -107,7 +138,11 @@ impl Connections {
                 .commands
                 .as_ref()
                 .ok_or_else(stopped)?
-                .try_send(Request { connected, reply })
+                .try_send(Request::Connection {
+                    client,
+                    connected,
+                    reply,
+                })
                 .map_err(|_| {
                     BridgeError::new(
                         ErrorCode::Busy,
@@ -115,10 +150,54 @@ impl Connections {
                     )
                 })?;
         }
-        tokio::time::timeout(Duration::from_secs(18), response)
+        tokio::time::timeout(Duration::from_secs(25), response)
             .await
             .map_err(|_| BridgeError::new(ErrorCode::Timeout, "Device request timed out."))?
             .map_err(|_| stopped())?
+    }
+    pub async fn execute(
+        &self,
+        client: usize,
+        id: &str,
+        command: TrainerCommand,
+    ) -> Result<TrainerCommand> {
+        self.limits.clamp(command)?;
+        let (reply, response) = oneshot::channel();
+        {
+            let entries = self.entries.read().await;
+            if self.stop.is_cancelled() {
+                return Err(stopped());
+            }
+            let entry = entries
+                .get(id)
+                .ok_or_else(|| crate::control::unsupported("Device is not an FTMS trainer."))?;
+            let commands = entry
+                .commands
+                .as_ref()
+                .ok_or_else(crate::session::disconnected)?;
+            let lease = self.leases.write().await.entry(client).or_default().clone();
+            commands
+                .try_send(Request::Control {
+                    client,
+                    lease,
+                    command,
+                    reply,
+                })
+                .map_err(|_| {
+                    BridgeError::new(ErrorCode::Busy, "Device command queue is unavailable.")
+                })?;
+        }
+        tokio::time::timeout(Duration::from_secs(20), response)
+            .await
+            .map_err(|_| {
+                BridgeError::new(ErrorCode::Timeout, "Trainer command request timed out.")
+            })?
+            .map_err(|_| stopped())?
+    }
+    pub async fn release_client(&self, client: usize) {
+        if let Some(lease) = self.leases.write().await.remove(&client) {
+            lease.cancel();
+        }
     }
     pub async fn shutdown(&self) {
         // Serialize cancellation with session creation before closing the tracker.
@@ -170,101 +249,187 @@ async fn cleanup(
     }
     result.map(|()| data)
 }
-async fn run(
+struct WorkerContext {
     transport: Arc<dyn FtmsTransport>,
     info: Arc<RwLock<DeviceInfo>>,
-    mut requests: mpsc::Receiver<Request>,
     bus: EventBus,
     stop: CancellationToken,
-) {
-    let id = info.read().await.id.clone();
-    let mut session: Option<FtmsSession> = None;
-    let mut assembler = RecordAssembler::default();
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_parse_error = None;
-    // Failed teardown must be retried before reopening the same peripheral.
+    limits: SafetyLimits,
+}
+impl WorkerContext {
+    async fn open(&self) -> Result<ActiveSession> {
+        let io = bounded(10, self.transport.open()).await?;
+        let mut capabilities = decode_features(&io.features)?;
+        if let Some(control) = &io.control {
+            capabilities.extend(control.profile.capabilities(self.limits));
+        }
+        self.info.write().await.capabilities = capabilities;
+        let id = self.info.read().await.id.clone();
+        Ok(ActiveSession::new(
+            io,
+            self.transport.clone(),
+            self.bus.clone(),
+            id,
+            self.limits,
+        ))
+    }
+    async fn close(&self, active: &mut Option<ActiveSession>) -> Result<DeviceInfo> {
+        if let Some(session) = active {
+            session.safe_release().await;
+        }
+        *active = None;
+        cleanup(self.transport.as_ref(), &self.info, &self.bus).await
+    }
+    fn retry(&self, id: &str, attempt: usize) -> Option<(usize, tokio::time::Instant)> {
+        let delay = *[1, 2, 5, 10, 30].get(attempt)?;
+        self.bus.publish(Event::DeviceReconnecting {
+            device_id: id.into(),
+            attempt: attempt as u8 + 1,
+            delay_seconds: delay,
+        });
+        Some((
+            attempt,
+            tokio::time::Instant::now() + Duration::from_secs(delay),
+        ))
+    }
+}
+async fn run(context: WorkerContext, mut requests: mpsc::Receiver<Request>) {
+    let id = context.info.read().await.id.clone();
+    let mut active: Option<ActiveSession> = None;
     let mut needs_cleanup = false;
+    let mut reconnect = None;
+    let mut link = tokio::time::interval(Duration::from_secs(1));
+    let mut ramp = tokio::time::interval(Duration::from_millis(250));
+    link.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ramp.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        if stop.is_cancelled() {
+        if context.stop.is_cancelled() {
             break;
         }
+        let owner = active.as_ref().and_then(|session| session.owner.clone());
+        let connected = active.is_some();
         tokio::select! {
             biased;
-            _ = stop.cancelled() => break,
-            request = requests.recv() => {
-                let Some(mut request) = request else {break};
-                if request.reply.is_closed() {continue;}
-                let result = if request.connected {
-                    if session.is_some() { Ok(info.read().await.clone()) }
-                    else {
-                        let opened = tokio::select! {
-                            _ = stop.cancelled() => Err(stopped()),
-                            _ = request.reply.closed() => Err(BridgeError::new(ErrorCode::DeviceDisconnected,"Connection requester left before setup completed.")),
-                            result = bounded(10,async {
-                                if needs_cleanup { transport.disconnect().await?; }
-                                let opened = transport.open().await?;
-                                let capabilities = decode_features(&opened.features)?;
-                                Ok((opened,capabilities))
-                            }) => result,
-                        };
-                        match opened {
-                            Ok((opened,capabilities)) => {
-                                info.write().await.capabilities = capabilities;
-                                session = Some(opened); needs_cleanup = true;
-                                assembler = RecordAssembler::default(); last_parse_error = None;
-                                Ok(mark(&info,true,&bus).await)
-                            }
-                            Err(error) => {
-                                needs_cleanup = cleanup(transport.as_ref(),&info,&bus).await.is_err();
-                                bus.publish(Event::Error {data:error.clone()});
-                                Err(error)
-                            }
-                        }
-                    }
-                } else if session.take().is_some() || needs_cleanup {
-                    assembler = RecordAssembler::default();
-                    let result = cleanup(transport.as_ref(),&info,&bus).await;
-                    needs_cleanup = result.is_err(); result
-                } else { Ok(info.read().await.clone()) };
-                let _ = request.reply.send(result);
+            _=context.stop.cancelled()=>break,
+            _=async {match &owner {Some((_,lease))=>lease.cancelled().await,None=>std::future::pending().await}}=>{
+                needs_cleanup=context.close(&mut active).await.is_err();
+                reconnect=None;
             }
-            notification = async { match &mut session { Some(active) => active.notifications.next().await, None => std::future::pending().await } } => {
-                match notification {
-                    Some(bytes) => match assembler.push(&bytes,tokio::time::Instant::now(),timestamp_ms()) {
-                        Ok(Some(data)) => { bus.publish(Event::Telemetry { device_id:id.clone(),data }); }
-                        Ok(None) => {},
-                        Err(error) => {
-                            let now = tokio::time::Instant::now();
-                            if last_parse_error.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(5)) {
-                                tracing::warn!(device_id = %id, message = %error.message, "Invalid FTMS measurement dropped");
-                                bus.publish(Event::Error {data:error}); last_parse_error = Some(now);
-                            }
+            request=requests.recv()=> {
+                let Some(request)=request else {break};
+                match request {
+                    Request::Connection {client,connected,mut reply}=>{
+                        if reply.is_closed() {continue;}
+                        if !connected && let Some(session)=&active && let Err(error)=session.require_owner(client) {
+                            let _=reply.send(Err(error)); continue;
                         }
-                    },
-                    None => {
-                        session = None; assembler = RecordAssembler::default();
-                        bus.publish(Event::Error { data:BridgeError::new(ErrorCode::DeviceDisconnected,"FTMS notification stream ended. Reconnect the trainer explicitly.") });
-                        needs_cleanup = cleanup(transport.as_ref(),&info,&bus).await.is_err();
+                        reconnect=None;
+                        let result=if connected {
+                            if active.is_some() {Ok(context.info.read().await.clone())}
+                            else {
+                                let opened=tokio::select! {
+                                    _=context.stop.cancelled()=>Err(stopped()),
+                                    _=reply.closed()=>Err(BridgeError::new(ErrorCode::DeviceDisconnected,"Connection requester left during setup.")),
+                                    result=async {
+                                        if needs_cleanup {bounded(3,context.transport.disconnect()).await?;}
+                                        context.open().await
+                                    }=>result,
+                                };
+                                match opened {
+                                    Ok(session)=>{active=Some(session); needs_cleanup=true; Ok(mark(&context.info,true,&context.bus).await)}
+                                    Err(error)=>{
+                                        needs_cleanup=context.close(&mut active).await.is_err();
+                                        context.bus.publish(Event::Error {data:error.clone()}); Err(error)
+                                    }
+                                }
+                            }
+                        } else if active.is_some() || needs_cleanup {
+                            let result=context.close(&mut active).await;needs_cleanup=result.is_err();result
+                        } else {Ok(context.info.read().await.clone())};
+                        let _=reply.send(result);
+                    }
+                    Request::Control {client,lease,command,mut reply}=>{
+                        if reply.is_closed() || lease.is_cancelled() {continue;}
+                        let Some(session)=&mut active else {let _=reply.send(Err(crate::session::disconnected()));continue;};
+                        let result=tokio::select! {
+                            _=reply.closed()=>{session.cancel_uncertain();Err(BridgeError::new(ErrorCode::TrainerControlFailed,"Command caller left or timed out."))},
+                            result=session.execute(client,lease,command,&context.stop)=>result,
+                        };
+                        let owns=session.owner.as_ref().is_some_and(|(owner,_)|*owner==client);
+                        let failed=result.is_err();
+                        if let Err(error)=&result {context.bus.publish(Event::Error {data:error.clone()});}
+                        tracing::info!(device_id=%id,?command,success=!failed,"Trainer control command completed");
+                        if (reply.send(result).is_err() || failed) && owns {
+                            needs_cleanup=context.close(&mut active).await.is_err();reconnect=None;
+                        }
                     }
                 }
             }
-            _ = interval.tick(), if session.is_some() => {
-                let state = tokio::select! {
-                    _ = stop.cancelled() => break,
-                    state = bounded(3,transport.is_connected()) => state,
+            _=async {match reconnect {Some((_,deadline))=>tokio::time::sleep_until(deadline).await,None=>std::future::pending().await}}=>{
+                let attempt=reconnect.take().map(|(attempt,_)|attempt).unwrap_or(0);
+                tracing::info!(device_id=%id,attempt=attempt+1,"Trainer reconnect attempt");
+                let opened=tokio::select! {
+                    _=context.stop.cancelled()=>Err(stopped()),
+                    result=async {
+                        if needs_cleanup {bounded(3,context.transport.disconnect()).await?;}
+                        context.open().await
+                    }=>result,
                 };
-                if !matches!(state,Ok(true)) {
-                    session = None; assembler = RecordAssembler::default();
-                    let error = state.err().unwrap_or_else(|| BridgeError::new(ErrorCode::DeviceDisconnected,"Trainer disconnected. Reconnect it explicitly."));
-                    bus.publish(Event::Error {data:error});
-                    needs_cleanup = cleanup(transport.as_ref(),&info,&bus).await.is_err();
+                match opened {
+                    Ok(session)=>{active=Some(session);needs_cleanup=true;mark(&context.info,true,&context.bus).await;}
+                    Err(error)=>{
+                        context.bus.publish(Event::Error {data:error});
+                        needs_cleanup=context.close(&mut active).await.is_err();
+                        reconnect=context.retry(&id,attempt+1);
+                    }
+                }
+            }
+            event=async {match &mut active {Some(session)=>session.next_event().await,None=>std::future::pending().await}}=>{
+                let SessionEvent::Control(event)=event else {
+                    if let SessionEvent::Telemetry(packet)=event {
+                        match packet {
+                            Some(bytes)=>if let Some(session)=&mut active {session.telemetry(&bytes);},
+                            None=>{
+                                context.bus.publish(Event::Error {data:crate::session::disconnected()});
+                                needs_cleanup=context.close(&mut active).await.is_err();
+                                if context.limits.auto_reconnect {reconnect=context.retry(&id,0);}
+                            }
+                        }
+                    }
+                    continue;
+                };
+                let link_lost=event.is_none();
+                let result=match event {
+                    Some(crate::transport::ControlEvent::Status(bytes))=>match &mut active {Some(session)=>session.status(&bytes,None),None=>Ok(())},
+                    Some(crate::transport::ControlEvent::Indication(_))=>{
+                        if let Some(session)=&mut active {session.cancel_uncertain();}
+                        Err(crate::control::invalid("Unsolicited FTMS control indication; session closed."))
+                    }
+                    None=>Err(crate::session::disconnected()),
+                };
+                if let Err(error)=result {
+                    context.bus.publish(Event::Error {data:error});
+                    needs_cleanup=context.close(&mut active).await.is_err();
+                    reconnect=if link_lost && context.limits.auto_reconnect {context.retry(&id,0)} else {None};
+                }
+            }
+            _=ramp.tick(),if connected=>{
+                if let Some(session)=&mut active && let Err(error)=session.advance_ramp(&context.stop).await {
+                    context.bus.publish(Event::Error {data:error});
+                    needs_cleanup=context.close(&mut active).await.is_err();reconnect=None;
+                }
+            }
+            _=link.tick(),if connected=>{
+                let result=tokio::select! {_=context.stop.cancelled()=>break,result=bounded(3,context.transport.is_connected())=>result};
+                if !matches!(result,Ok(true)) {
+                    context.bus.publish(Event::Error {data:result.err().unwrap_or_else(crate::session::disconnected)});
+                    needs_cleanup=context.close(&mut active).await.is_err();
+                    if context.limits.auto_reconnect {reconnect=context.retry(&id,0);}
                 }
             }
         }
     }
-    drop(session);
-    if needs_cleanup {
-        let _ = cleanup(transport.as_ref(), &info, &bus).await;
+    if active.is_some() || needs_cleanup {
+        let _ = context.close(&mut active).await;
     }
 }

@@ -3,3 +3,7 @@
 *.log
 .idea/
 .vscode/
+
+# Local recordings; checked-in examples live under examples/traces/.
+/*.biketrace
+/*.bike

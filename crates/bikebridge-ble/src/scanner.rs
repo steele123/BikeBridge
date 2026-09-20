@@ -5,7 +5,7 @@ use crate::{
 };
 use bikebridge_core::{
     AdapterInfo, AdapterState, BridgeError, DeviceInfo, ErrorCode, Event, EventBus, Result,
-    ScanStatus,
+    SafetyLimits, ScanStatus, TrainerCommand,
 };
 use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use tokio::sync::{RwLock, mpsc, oneshot};
@@ -31,6 +31,7 @@ pub struct DiscoverySnapshot {
 #[derive(Clone)]
 pub struct Scanner {
     connections: Connections,
+    controllers: bikebridge_openbikecontrol::Controllers,
     snapshot: Arc<RwLock<DiscoverySnapshot>>,
     commands: mpsc::Sender<Request>,
     shutdown: CancellationToken,
@@ -49,6 +50,7 @@ struct Request {
 
 struct Worker<B> {
     connections: Connections,
+    controllers: bikebridge_openbikecontrol::Controllers,
     backend: B,
     snapshot: Arc<RwLock<DiscoverySnapshot>>,
     bus: EventBus,
@@ -67,10 +69,30 @@ impl Scanner {
         bus: EventBus,
         preferred_index: Option<usize>,
     ) -> Self {
+        Self::spawn_inner(backend, bus, preferred_index, SafetyLimits::default()).await
+    }
+    /// Initialize discovery and device sessions with validated trainer safety/reconnection settings.
+    pub async fn spawn_configured(
+        backend: impl DiscoveryBackend,
+        bus: EventBus,
+        preferred_index: Option<usize>,
+        limits: SafetyLimits,
+    ) -> Result<Self> {
+        limits.validate()?;
+        Ok(Self::spawn_inner(backend, bus, preferred_index, limits).await)
+    }
+    async fn spawn_inner(
+        backend: impl DiscoveryBackend,
+        bus: EventBus,
+        preferred_index: Option<usize>,
+        limits: SafetyLimits,
+    ) -> Self {
         let snapshot = Arc::new(RwLock::new(DiscoverySnapshot::default()));
-        let connections = Connections::new(bus.clone());
+        let connections = Connections::with_limits(bus.clone(), limits);
+        let controllers = bikebridge_openbikecontrol::Controllers::new(bus.clone());
         let mut worker = Worker {
             connections: connections.clone(),
+            controllers: controllers.clone(),
             backend,
             snapshot: snapshot.clone(),
             bus,
@@ -116,6 +138,7 @@ impl Scanner {
         });
         Self {
             connections,
+            controllers,
             snapshot,
             commands,
             shutdown,
@@ -128,12 +151,22 @@ impl Scanner {
         let mut snapshot = self.snapshot.read().await.clone();
         for device in &mut snapshot.devices {
             self.connections.overlay(device).await;
+            self.controllers.overlay(device).await;
         }
         snapshot
     }
 
     /// Explicitly connect or disconnect a discovered indoor bike. Scanning is independent.
     pub async fn set_connection(&self, id: &str, connected: bool) -> Result<DeviceInfo> {
+        self.set_connection_for(0, id, connected).await
+    }
+    /// Connect/disconnect on behalf of a client; an owned trainer can only be disconnected by its owner.
+    pub async fn set_connection_for(
+        &self,
+        client: usize,
+        id: &str,
+        connected: bool,
+    ) -> Result<DeviceInfo> {
         if !self
             .snapshot
             .read()
@@ -147,7 +180,31 @@ impl Scanner {
                 "Device not found.",
             ));
         }
-        self.connections.set_connection(id, connected).await
+        if self.controllers.contains(id).await {
+            return self.controllers.set_connection(id, connected).await;
+        }
+        self.connections
+            .set_connection_for(client, id, connected)
+            .await
+    }
+    /// Submit a bounded, safety-clamped command to a connected trainer.
+    pub async fn execute(
+        &self,
+        client: usize,
+        id: &str,
+        command: TrainerCommand,
+    ) -> Result<TrainerCommand> {
+        if self.controllers.contains(id).await {
+            return Err(BridgeError::new(
+                ErrorCode::UnsupportedOperation,
+                "Controller inputs cannot execute trainer commands.",
+            ));
+        }
+        self.connections.execute(client, id, command).await
+    }
+    /// Cancel queued commands and release control held by a departing API client.
+    pub async fn release_client(&self, client: usize) {
+        self.connections.release_client(client).await;
     }
 
     /// Refresh adapter enumeration while idle; scanning handles are left undisturbed.
@@ -187,6 +244,7 @@ impl Scanner {
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
         self.connections.shutdown().await;
+        self.controllers.shutdown().await;
         self.tasks.close();
         self.tasks.wait().await;
     }
@@ -321,6 +379,14 @@ impl<B: DiscoveryBackend> Worker<B> {
                     for event in &mut events {
                         if let Event::DeviceDiscovered { data } | Event::DeviceUpdated { data } =
                             event
+                            && data.kind == bikebridge_core::DeviceKind::BikeController
+                            && let Some((adapter, key)) = self.registry.private_keys(&data.id)
+                            && let Some(transport) = self.backend.controller(adapter, key)
+                        {
+                            self.controllers.register(data, transport).await;
+                        }
+                        if let Event::DeviceDiscovered { data } | Event::DeviceUpdated { data } =
+                            event
                             && data.kind == bikebridge_core::DeviceKind::Trainer
                             && let Some((adapter, key)) = self.registry.private_keys(&data.id)
                             && let Some(transport) = self.backend.peripheral(adapter, key)
@@ -333,7 +399,12 @@ impl<B: DiscoveryBackend> Worker<B> {
                         if let Event::DeviceDiscovered { data } = &event {
                             tracing::info!(device_id = %data.id, kind = ?data.kind, "Cycling device discovered");
                         }
-                        self.connections.publish_discovery(event).await;
+                        if matches!(&event,Event::DeviceDiscovered {data} | Event::DeviceUpdated {data} if data.kind==bikebridge_core::DeviceKind::BikeController)
+                        {
+                            self.controllers.publish_discovery(event).await;
+                        } else {
+                            self.connections.publish_discovery(event).await;
+                        }
                     }
                 }
             }

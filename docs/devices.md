@@ -23,14 +23,16 @@ radio, scan for cycling services, and publish normalized discovery events.
 Scanning does not connect devices. The daemon starts without a working radio
 and exposes failures through `status.scan.lastError` and scan API error responses.
 
-| Advertised service | SIG UUID | Provisional device kind |
+| Advertised service | Service UUID | Provisional device kind |
 | --- | --- | --- |
 | Fitness Machine | `0x1826` | `trainer` |
+| OpenBikeControl | `d273f680-d548-419d-b9d1-fa0472345229` | `bike_controller` |
 | Cycling Power | `0x1818` | `power_meter` |
 | Cycling Speed and Cadence | `0x1816` | `cadence_sensor` |
 | Heart Rate | `0x180D` | `heart_rate_monitor` |
 
-These UUIDs were checked against [Bluetooth SIG Assigned Numbers](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Assigned_Numbers/out/en/index-en.html).
+The four standard UUIDs were checked against [Bluetooth SIG Assigned Numbers](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Assigned_Numbers/out/en/index-en.html).
+The OpenBikeControl UUID comes from its [BLE specification](https://github.com/OpenBikeControl/openbikecontrol-protocol/blob/c057e1d7ad05ceb1a6d59a0ca95e57394b7f9b48/BLE.md).
 When a device advertises multiple listed services, primary role precedence follows
 the table order. All recognized service indications are merged internally across
 partial advertisements. Names alone are never used to infer compatibility.
@@ -72,7 +74,7 @@ Bluetooth permission. The normal build still includes the platform libraries.
 On the local Windows x64 host, native adapter enumeration and scan start/stop were
 successfully exercised. No cycling peripheral advertised during that check, so
 physical-device classification remains unverified locally. Injected backend tests
-cover the four service types, identity/metadata behavior, lifecycle failures, and
+cover the standard service types and OpenBikeControl, identity/metadata behavior, lifecycle failures, and
 HTTP/WebSocket discovery. Linux/macOS CI is configured but has not been run here.
 
 ## Phase 3 (implemented: FTMS telemetry)
@@ -84,14 +86,13 @@ It rejects other exercise-machine types without Indoor Bike Data. Advertised nam
 and manufacturer names do not bypass these checks.
 
 The decoder publishes available power/cadence/speed and selected optional metrics.
-Measurement capabilities come from the feature characteristic; control capabilities
-remain absent. [Decoder layout and limitations](ftms.md) document the verified SIG
+Measurement capabilities come from the feature characteristic; Phase 4 separately
+validates control capabilities. [Decoder layout and limitations](ftms.md) document the verified SIG
 format and strict packet checks, including the uint8 resistance field layout.
 
 Lost links and notification-stream closure disconnect the session and emit events.
-Explicit disconnect and shutdown attempt bounded OS teardown. Retry using `connect`;
-automatic reconnection is deferred to Phase 4. Feature/range checks for control,
-control-point transactions, and safe load commands also belong to Phase 4.
+Explicit disconnect and shutdown attempt bounded teardown. Retry using `connect`,
+or enable the optional bounded automatic reconnect policy described in the protocol.
 
 The complete bytes-to-WebSocket path is tested with an injected transport. No
 physical trainer has supplied telemetry in this environment; compatibility with
@@ -111,10 +112,34 @@ Stop with `bikebridge disconnect <device-id>` or Ctrl+C in the daemon terminal.
 Record the model, firmware, OS, observed fields, and any typed errors when reporting
 compatibility. No raw Bluetooth identifiers are needed.
 
-## Later controller support
+## Phase 4 (implemented: FTMS control)
 
-OpenBikeControl integration is optional and belongs in its own crate after its
-actual network protocol is verified. Direct proprietary Zwift BLE behavior is not
-required. Inputs already use a hardware-independent vocabulary so later controllers
-can publish the same event shape. No compatibility with Zwift Click, Play, Ride,
-Di2, AXS, or any physical trainer is claimed by this phase.
+The Control Point (`0x2AD9`, WRITE/INDICATE) and Machine Status (`0x2ADA`, NOTIFY)
+are required for control. Target-setting features gate resistance, ERG, and indoor
+bike simulation. Resistance and ERG also require valid six-byte supported ranges
+(`0x2AD6`, `0x2AD8`). Unsupported modes remain unavailable while telemetry continues.
+Three-byte resistance ranges are deliberately unsupported; see the documented
+[SIG errata and wire-format choices](ftms-control.md).
+
+Single-client ownership, acknowledged writes, configured ceilings, resistance
+ramps, cancellation, best-effort Stop/Reset, and bounded reconnects are exercised
+with injected transports. Run `node examples/javascript/control.mjs <device-id>`
+for interactive control. Complete the [physical acceptance checks](ftms-control.md#hardware-acceptance)
+before claiming compatibility for a trainer model or relying on cleanup behavior.
+
+## OpenBikeControl controller bridge (implemented)
+
+Click, Play, Ride, Shimano Di2, and SRAM AXS inputs can reach BikeBridge through BikeControl's
+OpenBikeControl BLE bridge on a phone or second computer. The new
+`bikebridge-openbikecontrol` crate owns decoding, button state, connection workers,
+release-on-disconnect, and bounded retries; native GATT remains in `bikebridge-ble`.
+See [Zwift controller setup](zwift-controllers.md) and [Di2 / AXS setup](di2-axs.md).
+Di2 needs D-Fly assignments; AXS needs BikeControl 6.3+ for individual buttons and
+its setup/restore workflow. The same bridge driver handles their mapped actions.
+
+Connect explicitly using the ordinary device commands. The connected bridge has
+`controller_input` capability and publishes normalized `input` events, which the
+recorder captures without special handling. Bridge identity aggregates its physical
+controllers; it does not identify each physical button source. No physical hardware
+has been validated here. Native proprietary Zwift/Di2/AXS pairing, network OpenBikeControl,
+and certification are not implemented.

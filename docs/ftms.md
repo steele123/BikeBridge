@@ -13,7 +13,7 @@ Connection requires Fitness Machine Service `0x1826`, readable Fitness Machine
 Feature `0x2ACC`, and notifying Indoor Bike Data `0x2AD2`. The eight-byte feature
 value contains two little-endian 32-bit bitmaps. Speed is mandatory for indoor bikes;
 measurement bits 1, 10, and 14 indicate cadence, heart rate, and power. Target-setting
-bits do not grant any Phase 3 control capability.
+bits are validated separately by the [Phase 4 control path](ftms-control.md).
 
 ## Notification layout
 
@@ -45,7 +45,10 @@ uses that exact width, with no heuristic fallback to alternate encodings. Packet
 using a two-byte resistance field are rejected by the strict length check. Such
 hardware requires an explicitly verified transport-specific compatibility option
 before it can be supported. Raw resistance is not the public normalized 0–1
-resistance value; publishing it would require range verification and mapping.
+resistance value; it remains unpublished. The signed 16-bit control parameter and
+six-byte supported control range selected in Phase 4 do not change this measurement
+parser. Trainers emitting two-byte resistance measurements still need an explicit
+compatibility implementation.
 
 ## Complete records and failure policy
 

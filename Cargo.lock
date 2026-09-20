@@ -150,6 +150,7 @@ name = "bikebridge-ble"
 version = "0.1.0"
 dependencies = [
  "bikebridge-core",
+ "bikebridge-openbikecontrol",
  "btleplug",
  "futures-util",
  "serde_json",
@@ -167,6 +168,7 @@ dependencies = [
  "bikebridge-ble",
  "bikebridge-core",
  "bikebridge-server",
+ "bikebridge-trace",
  "clap",
  "serde",
  "serde_json",
@@ -208,13 +210,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "bikebridge-openbikecontrol"
+version = "0.1.0"
+dependencies = [
+ "bikebridge-core",
+ "futures-util",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "bikebridge-server"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "bikebridge-ble",
  "bikebridge-core",
  "bikebridge-mock",
+ "bikebridge-openbikecontrol",
+ "bikebridge-trace",
  "futures-util",
  "serde",
  "serde_json",
@@ -222,6 +238,16 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "bikebridge-trace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bikebridge-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

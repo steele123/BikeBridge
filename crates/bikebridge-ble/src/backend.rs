@@ -44,6 +44,14 @@ pub trait DiscoveryBackend: Send + 'static {
         &mut self,
         adapter: &str,
     ) -> impl Future<Output = Result<Vec<Advertisement>>> + Send;
+    /// Resolve a verified OpenBikeControl candidate without connecting.
+    fn controller(
+        &self,
+        _adapter: &str,
+        _key: &str,
+    ) -> Option<Arc<dyn bikebridge_openbikecontrol::ControllerTransport>> {
+        None
+    }
     /// Resolve a retained peripheral without starting any I/O. Discovery-only backends may omit this.
     fn peripheral(
         &self,
@@ -89,6 +97,19 @@ impl NativeBackend {
 }
 
 impl DiscoveryBackend for NativeBackend {
+    fn controller(
+        &self,
+        adapter: &str,
+        key: &str,
+    ) -> Option<Arc<dyn bikebridge_openbikecontrol::ControllerTransport>> {
+        self.peripherals
+            .get(&(adapter.to_owned(), key.to_owned()))
+            .cloned()
+            .map(|peripheral| {
+                Arc::new(crate::controller_transport::NativeController(peripheral))
+                    as Arc<dyn bikebridge_openbikecontrol::ControllerTransport>
+            })
+    }
     fn peripheral(
         &self,
         adapter: &str,

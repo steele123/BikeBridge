@@ -10,6 +10,12 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventCategory {
+    /// Requested trainer commands and their outcomes.
+    Command,
+    /// Client session lifecycle.
+    Session,
+    /// Replay lifecycle.
+    Replay,
     /// Scan lifecycle and failures.
     Scan,
     /// Trainer measurements.
@@ -36,6 +42,9 @@ impl Subscription {
     pub fn matches(&self, event: &Event) -> bool {
         let category = match event.category() {
             "scan" => EventCategory::Scan,
+            "command" => EventCategory::Command,
+            "session" => EventCategory::Session,
+            "replay" => EventCategory::Replay,
             "telemetry" => EventCategory::Telemetry,
             "input" => EventCategory::Input,
             "device" => EventCategory::Device,

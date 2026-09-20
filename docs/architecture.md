@@ -22,7 +22,9 @@ effective command, so clamping is visible to the client.
 | --- | --- |
 | `bikebridge-core` | Device and capability models, signed measurements, normalized inputs, trainer trait, safety limits, typed errors, domain events |
 | `bikebridge-mock` | Deterministic MockTrainer, validated telemetry overrides, MockController |
-| `bikebridge-ble` | Native discovery, service classification, opaque identity map, per-device FTMS sessions and isolated measurement decoding |
+| `bikebridge-ble` | Native discovery, service classification, opaque identity map, per-device FTMS sessions, control transactions, range mapping, and measurement decoding |
+| `bikebridge-openbikecontrol` | Protocol decoding, input edges, held-state cleanup, independent controller workers |
+| `bikebridge-trace` | Bounded recording writer, versioned trace validation, passive deterministic playback |
 | `bikebridge-server` | Device state, control ownership, tick task, HTTP snapshots, JSON command schema, WebSocket subscriptions and lifecycle |
 | `bikebridge-cli` | Config, argument overrides, logging, native listener, signals, status/device CLI queries |
 | `bikebridge-example` | External WebSocket client using no server internals |
@@ -54,8 +56,8 @@ Adapter and platform identifiers stay private to the transport registry.
   than thirty seconds without a pong triggers cleanup at the next heartbeat.
 - One client owns trainer control; all clients may subscribe. Ownership is first
   successful command wins and persists until reset, disconnect, or shutdown.
-- Session teardown resets its owned trainer and decrements the active client count.
-- Shutdown cancels the ticker and sessions, clears trainer load, and joins tasks.
+- Session teardown releases its owned trainer and decrements the active client count.
+- Shutdown cancels the ticker and sessions, attempts load cleanup, and joins tasks.
 
 ## BLE discovery lifecycle (Phase 2)
 
@@ -101,14 +103,16 @@ The discovery interface resolves a retained `FtmsTransport` without connecting.
 Advertised roles remain provisional until actual GATT features are verified.
 Shutdown cancels and joins discovery and attempts a bounded OS scan stop.
 
-## FTMS session lifecycle (Phase 3)
+## FTMS session lifecycle (Phases 3–4)
 
 An explicit connection lazily starts one worker for that device with a four-request
-queue. Its injectable `FtmsTransport` provides only open/connection-check/disconnect;
+queue. Its injectable `FtmsTransport` provides open, connection checks, control writes, and disconnect;
 the native implementation connects, discovers characteristics under the FTMS
 service, validates READ/NOTIFY properties, reads features, installs a notification
-receiver, and subscribes to Indoor Bike Data. No trainer control operation exists
-in this interface. Open has a ten-second deadline. A partially failed or cancelled
+receiver, and subscribes to Indoor Bike Data. When Control Point (WRITE/INDICATE)
+and Machine Status (NOTIFY) are present, it installs a separate ordered control
+stream and reads supported ranges. Missing control characteristics preserve a
+telemetry-only session; malformed ranges disable the corresponding load mode. Open has a ten-second deadline. A partially failed or cancelled
 open always attempts disconnect with a three-second deadline. Cleanup failures
 remain observable and are retried before reopening the peripheral.
 
@@ -122,35 +126,61 @@ across enumeration so refreshing adapters does not replace active session handle
 Every second, a connected worker checks the OS link with a three-second deadline.
 Failed checks and notification-stream closure end the session and clear partial
 records. Silence alone is not treated as disconnect: a trainer may be asleep or
-not pedaling. There is no automatic reconnection or historical measurement replay.
+not pedaling. Optional automatic reconnection is bounded to five attempts with
+1/2/5/10/30-second delays and emits `device.reconnecting` before each attempt.
+Successful reconnection clears retry state and establishes telemetry without any
+ownership or target replay. Explicit disconnect cancels retries.
 Explicit disconnect and shutdown release sessions; viewer exit and scan stop leave
 established connections available to others. A cancelled pending connect cleans up.
 
-WebSocket connection requests run as a polled future alongside that socket's
+WebSocket connection and trainer requests run as a polled future alongside that socket's
 event receiver and heartbeat. Only one can be pending per socket. HTTP and other
 devices remain responsive during slow setup. The session task tracker joins all
 device workers on shutdown. See [FTMS field and record rules](ftms.md).
 
+## FTMS control transactions
+
+Each device worker owns its Control Point transactions, exclusive client lease,
+resistance ramp, and feature/range profile. Client teardown cancels the lease even
+while a write is waiting. A procedure requires both a successful WithResponse write
+and a matching indication, with a three-second total deadline. Telemetry is consumed
+throughout. Wrong/duplicate opcodes, timeout, cancellation, or a failed write make
+the outcome uncertain and close the connection without overlapping another write.
+
+Control is requested before any load command. Unsupported commands are rejected
+before acquisition. Other clients cannot change or disconnect an owned trainer.
+Resistance increases use a 250 ms ticker and elapsed time since the last confirmed
+step, snapped down to the device grid; entering resistance mode first establishes
+the device minimum. Decreases bypass the slew limit. Mode changes cancel the ramp.
+Each step waits for its own acknowledgement. Stop also resets FTMS permission;
+local ownership remains until Reset or client exit.
+
+Owner exit, explicit disconnect, execution failure, and shutdown attempt Stop then
+Reset only when permission and transaction synchronization remain valid. Revoked
+control is never automatically reacquired during cleanup. OS disconnect follows,
+with its own deadline. Link failure can prevent all cleanup writes. See
+[FTMS control](ftms-control.md) for wire choices and physical validation limits.
+
 ## Safety scope
 
 Normalized resistance is a dimensionless 0–1 API value, **not** a raw FTMS level.
-The future BLE backend must map to discovered supported resistance ranges and
-validate feature bits before encoding commands.
+The BLE backend maps to verified supported resistance ranges and validates target
+feature bits before encoding commands.
 
 All trainer commands use `SafetyLimits`, also enforced by MockTrainer so callers
 cannot bypass them by skipping the API. Safety configuration has hard sanity
 ceilings: 2000 W, 25% absolute grade, and resistance 1.0. Default limits are lower.
 Simulation wind is clamped to ±20 m/s, `crr` to 0–0.02, and `cw` to 0–1. Resistance
-smoothing affects resistance mode; ERG/simulation here are measurement simulation,
-not a physical force model. A safe reset clears targets and overrides immediately.
+smoothing affects resistance mode. The mock ERG/simulation implementation generates
+measurements, not physical forces; its reset clears targets and overrides immediately.
 
 The mock's default rider still produces roughly 180 W after a reset, while its
 applied resistance is zero. Resetting removes the load target; `trainer.stop` also
 sets power, cadence, and speed to zero until `trainer.start`.
 
-No physical trainer has been exercised. Transport cancellation, FTMS request-control
-acknowledgements, device timeouts, hardware limits, and best-effort safe commands
-on BLE failure must be verified before enabling a real control backend.
+No physical trainer has been exercised. Injected transports verify transactions,
+cancellation, limits, and cleanup; device-specific load response and fail-safe
+behavior still require hardware acceptance testing.
 
 ## Security scope
 
@@ -167,4 +197,45 @@ and [Tokio Tungstenite client API](https://docs.rs/tokio-tungstenite/latest/toki
 Discovery uses [btleplug's Central API](https://docs.rs/btleplug/latest/btleplug/api/trait.Central.html)
 and the four verified service UUIDs from the [Bluetooth SIG Assigned Numbers](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Assigned_Numbers/out/en/index-en.html).
 FTMS field sources and the selected strict decoding policy are documented in
-[FTMS telemetry](ftms.md). No OpenBikeControl protocol is implemented yet.
+[FTMS telemetry](ftms.md). OpenBikeControl BLE sources and interoperability choices
+are in [Zwift controller inputs](zwift-controllers.md).
+
+
+## Recording and replay
+
+`EventBus` has one optional nonblocking observer. Its short publication mutex
+establishes identical event order for capture and broadcast. The recorder timestamps
+and enqueues before fan-out, so subscriber lag cannot silently corrupt a capture.
+A dedicated thread writes JSON Lines with periodic flushes. Failure is sticky;
+the recording CLI monitors it, gracefully stops the daemon, and reports failure.
+The recorder drains after all server sessions and BLE workers have shut down,
+then writes and syncs a completion footer. Recording starts before discovery and
+serving so the initial snapshot cannot race a producer.
+
+Trainer API execution has an audit guard: start, applied/failed result, or cancelled
+on future drop. This records the requested and effective commands across ownership
+checks, clamping, hardware errors, and client departure without replaying actions.
+
+Replay validates the complete bounded trace on a blocking thread before opening
+its API listener. `AppState::replay` constructs neither mocks nor a native backend.
+A five-millisecond scheduler advances the passive timeline and updates virtual
+device snapshots. A paused timeline consumes no elapsed time. Restart publishes a
+snapshot reset before replayed events. Recorded payload timestamps are preserved;
+relative monotonic offsets drive scheduling, scaled by the requested speed.
+The normal bounded subscriber bus still applies. No incoming or recorded command
+can reach hardware through the replay backend. See [Recorder / Replay](recorder-replay.md).
+
+
+## Controller bridge lifecycle
+
+Discovery also filters OpenBikeControl advertisements and classifies them as
+controllers. Native peripheral handles expose a separate `ControllerTransport`,
+not the trainer interface. Per-device workers use bounded queues and deadlines,
+subscribe before the app-info handshake, decode complete BLE notifications, and
+emit only changed input states. Discovery cannot trigger an automatic connection.
+
+A controller disconnect emits synthetic releases before its device event, ensuring
+applications do not retain held buttons or brakes. Reconnection uses five bounded
+backoff attempts and never restores held state. Viewer exit has no ownership effect;
+trainer control commands are rejected for controller identities. The process-wide
+recorder sees the same input/discovery/disconnect events as API subscribers.

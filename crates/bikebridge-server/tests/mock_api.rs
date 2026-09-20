@@ -1,4 +1,10 @@
 //! Real loopback HTTP/WebSocket integration tests; no Bluetooth hardware required.
+#[path = "support/controllers.rs"]
+mod controllers;
+#[path = "support/ftms_control.rs"]
+mod ftms_control;
+#[path = "support/trace.rs"]
+mod trace;
 use bikebridge_core::SafetyLimits;
 use bikebridge_server::AppState;
 use futures_util::{SinkExt, StreamExt};
@@ -142,12 +148,30 @@ impl bikebridge_ble::DiscoveryBackend for DiscoveryFixture {
 
 #[derive(Default)]
 struct TelemetryFixture {
+    control: bool,
+    hold_response: std::sync::atomic::AtomicBool,
+    control_sender: std::sync::Mutex<
+        Option<tokio::sync::mpsc::Sender<bikebridge_ble::transport::ControlEvent>>,
+    >,
+    writes: std::sync::Mutex<Vec<Vec<u8>>>,
     sender: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
     opened: std::sync::atomic::AtomicUsize,
     closed: std::sync::atomic::AtomicUsize,
     gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 }
 impl bikebridge_ble::transport::FtmsTransport for TelemetryFixture {
+    fn write_control<'a>(
+        &'a self,
+        bytes: &'a [u8],
+    ) -> futures_util::future::BoxFuture<'a, bikebridge_core::Result<()>> {
+        Box::pin(async move {
+            self.writes.lock().expect("mutex").push(bytes.to_vec());
+            if !self.hold_response.load(std::sync::atomic::Ordering::SeqCst) {
+                self.acknowledge(bytes[0]).await;
+            }
+            Ok(())
+        })
+    }
     fn open(
         &self,
     ) -> futures_util::future::BoxFuture<
@@ -162,7 +186,28 @@ impl bikebridge_ble::transport::FtmsTransport for TelemetryFixture {
             }
             let (sender, receiver) = tokio::sync::mpsc::channel(8);
             *self.sender.lock().expect("mutex") = Some(sender);
+            let control = if self.control {
+                let (sender, receiver) = tokio::sync::mpsc::channel(32);
+                *self.control_sender.lock().expect("mutex") = Some(sender);
+                Some(bikebridge_ble::transport::ControlSession {
+                    profile: bikebridge_ble::control::ControlProfile::discover(
+                        &[2, 64, 0, 0, 12, 32, 0, 0],
+                        Some(&[0, 0, 232, 3, 10, 0]),
+                        Some(&[0, 0, 220, 5, 5, 0]),
+                    )
+                    .expect("profile"),
+                    events: Box::pin(futures_util::stream::unfold(
+                        receiver,
+                        |mut receiver| async {
+                            receiver.recv().await.map(|event| (event, receiver))
+                        },
+                    )),
+                })
+            } else {
+                None
+            };
             Ok(bikebridge_ble::transport::FtmsSession {
+                control,
                 features: vec![2, 0x40, 0, 0, 255, 255, 255, 255],
                 notifications: Box::pin(futures_util::stream::unfold(
                     receiver,
@@ -179,11 +224,26 @@ impl bikebridge_ble::transport::FtmsTransport for TelemetryFixture {
             self.closed
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.sender.lock().expect("mutex").take();
+            self.control_sender.lock().expect("mutex").take();
             Ok(())
         })
     }
 }
 impl TelemetryFixture {
+    async fn acknowledge(&self, opcode: u8) {
+        let sender = self
+            .control_sender
+            .lock()
+            .expect("mutex")
+            .as_ref()
+            .expect("control stream")
+            .clone();
+        let _ = sender
+            .send(bikebridge_ble::transport::ControlEvent::Indication(vec![
+                128, opcode, 1,
+            ]))
+            .await;
+    }
     async fn packet(&self, bytes: &[u8]) {
         let sender = self
             .sender

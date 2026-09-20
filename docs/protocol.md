@@ -1,4 +1,4 @@
-# BikeBridge protocol v1 — Phases 1–2
+# BikeBridge protocol v1
 
 Connect a native client to `ws://127.0.0.1:9376/ws`. UTF-8 JSON text frames only.
 The daemon sends `hello` before any other application message:
@@ -39,9 +39,10 @@ Sessions initially subscribe to nothing. Each `subscribe` **replaces** both filt
 {"type":"subscribe","requestId":"sub","events":["telemetry","input","device"],"deviceIds":["mock-trainer","mock-controller"]}
 ```
 
-Event families are `telemetry`, `input`, `device`, `scan`, and `error`. `device` covers all
+Event families are `telemetry`, `input`, `device`, `scan`, `error`, `command`,
+`session`, and `replay`. `device` covers all
 `device.*` messages. Omitted or empty `deviceIds` means all devices; an empty
-`events` array unsubscribes from everything. At most five event categories and 64
+`events` array unsubscribes from everything. At most eight event categories and 64
 device filters (each 1–128 bytes) are accepted. Device filters do not prevent
 direct command responses. A device filter excludes events with no device identity.
 
@@ -76,16 +77,17 @@ fixtures and do not imply future BLE identity formats.
 
 Discovered BLE devices have `transport: "bluetooth"`, opaque `ble-…` IDs,
 `connected: false`, and initially empty `capabilities`. Their advertised role is
-provisional. Phase 3 supports explicit FTMS connection and telemetry. BLE trainer
-control commands return `unsupported_operation`. `device.updated` has the same `data`
+provisional. FTMS connection verifies telemetry and control capabilities; unsupported
+control modes return `unsupported_operation`. `device.updated` has the same `data`
 shape as `device.discovered`, and is emitted when name, RSSI, or classification
 changes. Missing advertisement fields do not erase previously seen metadata.
 
 For an FTMS candidate, `device.connect` discovers services, validates and reads
 Fitness Machine Feature, and subscribes to Indoor Bike Data before returning a
 successful response with the connected DeviceInfo. Capabilities include `speed`
-and feature-confirmed `power`, `cadence`, or `heart_rate`; no control capabilities
-are advertised. HTTP `POST /api/devices/{id}/connect` and `/disconnect` perform
+and feature-confirmed `power`, `cadence`, or `heart_rate`. With a usable Control Point
+and Machine Status channel, supported target bits and valid ranges add
+`resistance_control`, `erg_control`, or `simulation_control`. HTTP `POST /api/devices/{id}/connect` and `/disconnect` perform
 the same operation with an empty body and return DeviceInfo directly.
 
 ```json
@@ -95,23 +97,34 @@ the same operation with an empty body and return DeviceInfo directly.
 BLE sessions are shared by all local clients and persist when a viewer closes.
 Explicit disconnect, detected link loss, or daemon shutdown ends a session;
 stopping discovery does not. Repeated connect/disconnect requests are idempotent.
-Reconnection is explicit. Previously verified capabilities remain cached when
+Owner exit also closes its controlled BLE connection. Reconnection is explicit unless
+`[trainer].auto_reconnect = true`: link loss schedules at most five retries with
+1, 2, 5, 10, and 30 second delays. Each emits a device-filterable event:
+
+```json
+{"type":"device.reconnecting","deviceId":"ble-<opaque-uuid>","attempt":1,"delaySeconds":1}
+```
+
+Successful reconnection restores telemetry only. A client must reacquire control
+and explicitly send any new target. Explicit disconnect cancels retries; owner exit
+and control-command failures do not start retries. Previously verified capabilities remain cached when
 disconnected and are refreshed at the next successful connection. `connected`
 means a usable telemetry session; failed OS teardown clears it and also emits
 an error because underlying OS connection state may be uncertain.
 
 Connect setup has a ten-second deadline; teardown and connection-state checks
-have three-second deadlines. A WebSocket accepts one pending connection request
-while continuing to deliver events and process pings and other commands; another
-connection request on that socket gets `busy`. Leaving during setup cancels the
+have three-second deadlines. Each control write plus matching indication has a
+three-second total deadline. A WebSocket accepts one pending connection or trainer
+command while continuing to deliver events and process pings and subscriptions;
+another device operation on that socket gets `busy`. Leaving during setup cancels the
 request and attempts cleanup. Events and command responses may interleave.
 Connection errors are returned to the caller and published as `error` events;
 they do not overwrite `scan.lastError`.
 
 HTTP connection errors use 404 for unknown IDs, 422 for unsupported devices,
-409 for mock control ownership conflicts, 429 for a full queue, 504 for timeouts,
+409 for control ownership conflicts, 429 for a full queue, 504 for timeouts,
 and 503 for other device failures. HTTP connections cannot bypass an existing
-WebSocket client's mock trainer ownership.
+WebSocket client's trainer ownership.
 
 ## Bluetooth discovery
 
@@ -173,17 +186,21 @@ Mock mode returns no adapters and rejects scan requests with `bluetooth_unavaila
 | --- | --- | --- |
 | `trainer.requestControl` | No data field | Acquire exclusive ownership |
 | `trainer.reset` | No data field | Clear load and overrides; release ownership |
-| `trainer.start` | No data field | Resume simulated pedaling |
-| `trainer.stop` | No data field | Clear load; stop simulated pedaling; keep ownership |
+| `trainer.start` | No data field | Start/resume workout (simulated pedaling in mock mode) |
+| `trainer.stop` | No data field | Stop and reset BLE trainer; keep local ownership (stop simulated pedaling in mock mode) |
 | `trainer.setResistance` | `{"resistance":0.35}` | Clamp normalized resistance to 0…configured maximum |
 | `trainer.setTargetPower` | `{"watts":250}` | Clamp unsigned 16-bit target to configured maximum |
 | `trainer.setSimulation` | See below | Clamp simulation parameters |
 
-These control commands currently apply only to MockTrainer. All require `deviceId`.
+These commands apply to MockTrainer and connected FTMS trainers with control support.
+All require `deviceId`.
 The first successful command implicitly acquires control;
 `requestControl` is useful for acquiring it explicitly. Another client's commands
 fail with `trainer_control_denied`. Reset releases ownership. Owner disconnect
-clears targets; a telemetry-only client disconnect does not affect the owner.
+clears mock targets; for BLE it attempts Stop/Reset and closes the connection.
+A telemetry-only client disconnect does not affect the owner. BLE Stop also resets
+FTMS permission while retaining local ownership; the next command reacquires it.
+See [FTMS control](ftms-control.md) for exact failure and cleanup behavior.
 
 ```json
 {"type":"trainer.setResistance","deviceId":"mock-trainer","requestId":"r1","data":{"resistance":0.35}}
@@ -205,13 +222,21 @@ Successful trainer responses report the safety-clamped command:
 
 Operations are `request_control`, `reset`, `start`, `stop`, `set_resistance`,
 `set_target_power`, and `set_simulation`. Parameterless operations omit `value`.
-An accepted resistance target can differ from current telemetry during smoothing.
+BLE replies require a successful write and matching Control Point indication.
+For smoothed resistance, `applied` reports the accepted, quantized destination after
+establishing the minimum baseline if needed; later ramp steps each require their
+own acknowledgement. A response is not confirmation that the destination has been
+reached. Later failures emit `error` and disconnect the device. Real telemetry does
+not currently publish normalized resistance. Other commands report their confirmed,
+quantized target. Device telemetry can still differ from commanded targets.
 
 Default limits: 800 W, ±15% grade, resistance 0–0.7. Simulation wind: ±20 m/s;
 `crr`: 0–0.02; `cw`: 0–1 kg/m. Resistance smoothing defaults to 0.2 units/second.
 Finite excessive values are clamped; invalid numeric types, non-finite float values,
 negative ERG watts, and ERG integers above 65535 are rejected. These rules also
-apply to future hardware backends, which must enforce their own stricter limits.
+apply to the BLE backend, which also intersects device ranges and quantizes to
+supported increments. Upward BLE resistance ramps are rate limited; decreases
+bypass smoothing at the next ramp tick. ERG and simulation changes are not ramped.
 
 ## Telemetry
 
@@ -266,6 +291,10 @@ Digital inputs: `shift_up`, `shift_down`, `steering_left`, `steering_right`, `co
 Generic `button` additionally requires unsigned 16-bit `button` index; other inputs
 must omit it. `steering` requires `state: "value"` and a finite `value` from -1 to 1;
 `gear` requires `state: "value"` and an integer `value` from 1 to 100.
+`brake` requires `state: "value"` and a finite value from 0 to 2 (one fully applied
+brake is 1; combined braking can reach 2). Generic `button` also accepts
+`state: "value"` with a finite value from 0 to 255; the OpenBikeControl bridge uses
+this for unmodified protocol analog bytes. The `button` index remains required.
 
 ## HTTP endpoints
 
@@ -289,15 +318,44 @@ the selected adapter was last observed not powered off (unknown radio state can
 still be attempted); inspect `scan.lastError` for actual scan failures. Status and
 device endpoints read cached state without waiting for Bluetooth.
 
-HTTP trainer control is not implemented. Session-based WebSocket mock control is
+HTTP trainer control is not implemented. Session-based WebSocket trainer control is
 the supported interface. If HTTP trainer control is added later,
 its ownership/lease lifecycle must be defined first.
 
 ## Errors
 
 Current domain codes: `device_not_found`, `device_disconnected`, `connection_failed`, `invalid_device_data`,
-`unsupported_operation`, `trainer_control_denied`, `invalid_command`, `invalid_value`,
+`unsupported_operation`, `trainer_control_denied`, `trainer_control_failed`, `invalid_command`, `invalid_value`,
 `events_lost`, `bluetooth_unavailable`, `adapter_not_found`, `scan_failed`, `timeout`,
 and `busy`. `internal_error` remains reserved. HTTP access rejection uses `access_denied` with status 403.
 Transport write/heartbeat timeout, excessive message size, and rate violations
 close the session and release its control. Clients must tolerate disconnects.
+
+
+## Recorder and passive replay
+
+See [Recorder / Replay](recorder-replay.md) for the versioned `.biketrace` format,
+`command.started` / `command.finished`, `session.disconnected`, and `replay.reset`.
+The new event families are opt-in; existing telemetry subscriptions are unchanged.
+`GET /api/replay` returns status or null. `POST /api/replay/start`, `/pause`, and
+`/restart` control replay only. `/api/status` includes an optional `replay` object.
+
+Replay preserves original events and timestamps without constructing Bluetooth
+transports. Incoming trainer commands are rejected; recorded commands are emitted
+as events. Device snapshots and connection changes follow the trace. After restart,
+replace local device state with the snapshot in `replay.reset` or fetch `/api/devices`.
+
+
+## OpenBikeControl inputs
+
+A discovered OpenBikeControl BLE bridge is a `bike_controller`. Connect it with
+`device.connect` or the HTTP/CLI connection command. A verified notification
+channel advertises `controller_input`. Its normalized input events use the same
+subscription, recording, and replay path as mock inputs. Trainer commands on a
+controller return `unsupported_operation`.
+
+Connections are process-wide; viewer exit does not close them. Explicit disconnect
+cancels retries. Unexpected link loss emits releases for held inputs, a disconnect,
+and up to five `device.reconnecting` attempts. Protocol errors close the session
+without retry. Read [Zwift controller integration](zwift-controllers.md) for mappings,
+BikeControl setup, aggregate identity, and hardware validation limits.

@@ -77,3 +77,19 @@ pub(crate) async fn disconnect(
         .map(Json)
         .map_err(scan_error)
 }
+
+pub(crate) async fn replay_status(
+    State(state): State<AppState>,
+) -> Json<Option<bikebridge_trace::PlaybackStatus>> {
+    Json(state.replay_status().await)
+}
+pub(crate) async fn replay_action(
+    State(state): State<AppState>,
+    Path(action): Path<String>,
+) -> Result<Json<bikebridge_trace::PlaybackStatus>, (StatusCode, Json<Value>)> {
+    state
+        .replay_action(&action)
+        .await
+        .map(Json)
+        .map_err(scan_error)
+}

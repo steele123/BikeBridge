@@ -1,0 +1,17 @@
+{"record":"header","format":"bikebridge.trace","version":1,"protocolVersion":1,"bikeBridgeVersion":"0.1.0","createdAtMs":1789776000000,"devices":[{"id":"mock-di2-dfly","name":"Synthetic di2-dfly mapped inputs","kind":"bike_controller","transport":"mock","connected":true,"capabilities":["controller_input"]}]}
+{"record":"event","sequence":0,"offsetUs":250000,"event":{"type":"input","deviceId":"mock-di2-dfly","data":{"input":"shift_down","state":"pressed"},"timestampMs":1789776000250}}
+{"record":"event","sequence":1,"offsetUs":350000,"event":{"type":"input","deviceId":"mock-di2-dfly","data":{"input":"shift_down","state":"released"},"timestampMs":1789776000350}}
+{"record":"event","sequence":2,"offsetUs":750000,"event":{"type":"input","deviceId":"mock-di2-dfly","data":{"input":"shift_up","state":"pressed"},"timestampMs":1789776000750}}
+{"record":"event","sequence":3,"offsetUs":850000,"event":{"type":"input","deviceId":"mock-di2-dfly","data":{"input":"shift_up","state":"released"},"timestampMs":1789776000850}}
+{"record":"event","sequence":4,"offsetUs":1250000,"event":{"type":"input","deviceId":"mock-di2-dfly","data":{"input":"confirm","state":"pressed"},"timestampMs":1789776001250}}
+{"record":"event","sequence":5,"offsetUs":1350000,"event":{"type":"input","deviceId":"mock-di2-dfly","data":{"input":"confirm","state":"released"},"timestampMs":1789776001350}}
+{"record":"event","sequence":6,"offsetUs":1750000,"event":{"type":"input","deviceId":"mock-di2-dfly","data":{"input":"back","state":"pressed"},"timestampMs":1789776001750}}
+{"record":"event","sequence":7,"offsetUs":1850000,"event":{"type":"input","deviceId":"mock-di2-dfly","data":{"input":"back","state":"released"},"timestampMs":1789776001850}}
+{"record":"event","sequence":8,"offsetUs":2250000,"event":{"type":"input","deviceId":"mock-di2-dfly","data":{"input":"shift_up","state":"pressed"},"timestampMs":1789776002250}}
+{"record":"event","sequence":9,"offsetUs":2310000,"event":{"type":"input","deviceId":"mock-di2-dfly","data":{"input":"shift_up","state":"released"},"timestampMs":1789776002310}}
+{"record":"event","sequence":10,"offsetUs":2370000,"event":{"type":"input","deviceId":"mock-di2-dfly","data":{"input":"shift_up","state":"pressed"},"timestampMs":1789776002370}}
+{"record":"event","sequence":11,"offsetUs":2430000,"event":{"type":"input","deviceId":"mock-di2-dfly","data":{"input":"shift_up","state":"released"},"timestampMs":1789776002430}}
+{"record":"event","sequence":12,"offsetUs":3000000,"event":{"type":"input","deviceId":"mock-di2-dfly","data":{"input":"shift_down","state":"pressed"},"timestampMs":1789776003000}}
+{"record":"event","sequence":13,"offsetUs":4000000,"event":{"type":"input","deviceId":"mock-di2-dfly","data":{"input":"shift_down","state":"released"},"timestampMs":1789776004000}}
+{"record":"event","sequence":14,"offsetUs":4000000,"event":{"type":"device.disconnected","data":{"id":"mock-di2-dfly","name":"Synthetic di2-dfly mapped inputs","kind":"bike_controller","transport":"mock","connected":false,"capabilities":["controller_input"]}}}
+{"record":"end","events":15,"durationUs":5000000}

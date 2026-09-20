@@ -88,6 +88,10 @@ mod tests {
         assert_eq!(c.trainer.max_erg_watts, 500);
         assert_eq!(c.server.port, 9380);
         assert_eq!(c.server.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert!(!c.trainer.auto_reconnect);
+        let reconnect: Config =
+            toml::from_str("[trainer]\nauto_reconnect = true").expect("reconnection config");
+        assert!(reconnect.trainer.auto_reconnect);
         assert!(toml::from_str::<Config>("[trainer]\nmax_erg_watt = 500").is_err());
         let c: Config = toml::from_str("[server]\nhost = '0.0.0.0'").expect("parse");
         assert!(c.validate().is_err());

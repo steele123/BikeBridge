@@ -16,14 +16,14 @@ pub struct TrainerSimulation {
 }
 
 /// Transport-neutral trainer command.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "value", rename_all = "snake_case")]
 pub enum TrainerCommand {
     /// Acquire device control.
     RequestControl,
     /// Return to the safe default.
     Reset,
-    /// Resume telemetry simulation.
+    /// Start or resume the trainer's workout.
     Start,
     /// Stop and remove active load.
     Stop,
@@ -39,6 +39,8 @@ pub enum TrainerCommand {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SafetyLimits {
+    /// Reconnect previously connected BLE trainers after link loss, without restoring control.
+    pub auto_reconnect: bool,
     /// Maximum ERG target in watts.
     pub max_erg_watts: u16,
     /// Maximum absolute simulated grade in percent.
@@ -54,6 +56,7 @@ pub struct SafetyLimits {
 impl Default for SafetyLimits {
     fn default() -> Self {
         Self {
+            auto_reconnect: false,
             max_erg_watts: 800,
             max_grade_percent: 15.0,
             max_resistance: 0.7,

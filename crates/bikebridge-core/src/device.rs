@@ -22,6 +22,8 @@ pub enum DeviceKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceCapability {
+    /// Verified controller notification channel; individual button availability depends on its mapping.
+    ControllerInput,
     /// Power measurements in watts.
     Power,
     /// Cadence measurements in RPM.

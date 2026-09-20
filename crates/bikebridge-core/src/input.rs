@@ -15,6 +15,8 @@ pub enum BikeInput {
     SteeringRight,
     /// Absolute steering, with value between -1 and 1.
     Steering,
+    /// Brake strength, from zero to two fully applied brakes.
+    Brake,
     /// Gear selection, using an integer value.
     Gear,
     /// Confirm action.
@@ -56,17 +58,25 @@ pub struct InputData {
 impl InputData {
     /// Reject inconsistent states and malformed analog values.
     pub fn validate(&self) -> Result<()> {
-        let analog = matches!(self.input, BikeInput::Steering | BikeInput::Gear);
+        let analog = matches!(
+            self.input,
+            BikeInput::Steering | BikeInput::Gear | BikeInput::Brake
+        );
         let valid = if analog {
             self.state == InputState::Value
                 && self.value.is_some_and(|v| {
                     v.is_finite()
                         && match self.input {
                             BikeInput::Steering => (-1.0..=1.0).contains(&v),
+                            BikeInput::Brake => (0.0..=2.0).contains(&v),
                             BikeInput::Gear => (1.0..=100.0).contains(&v) && v.fract() == 0.0,
                             _ => false,
                         }
                 })
+        } else if self.input == BikeInput::Button && self.state == InputState::Value {
+            // Generic controller analog values retain the source's unsigned byte.
+            self.value
+                .is_some_and(|v| v.is_finite() && (0.0..=255.0).contains(&v))
         } else {
             self.state != InputState::Value && self.value.is_none()
         };

@@ -24,6 +24,8 @@ pub enum ErrorCode {
     UnsupportedOperation,
     /// Another client owns control.
     TrainerControlDenied,
+    /// A trainer rejected a control transaction or its outcome is uncertain.
+    TrainerControlFailed,
     /// Invalid message structure.
     InvalidCommand,
     /// Value is non-finite or out of range for an injection.

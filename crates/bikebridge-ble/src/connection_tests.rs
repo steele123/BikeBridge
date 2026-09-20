@@ -1,4 +1,11 @@
 use super::*;
+#[path = "control_tests.rs"]
+mod control_tests;
+use crate::transport::FtmsSession;
+use crate::{
+    control::ControlProfile,
+    transport::{ControlEvent, ControlSession},
+};
 use bikebridge_core::{DeviceCapability, DeviceKind};
 use futures_util::{future::BoxFuture, stream};
 use std::sync::{
@@ -8,6 +15,11 @@ use std::sync::{
 
 #[derive(Default)]
 struct Fake {
+    control_enabled: AtomicBool,
+    reply_mode: AtomicUsize,
+    emit_status: AtomicBool,
+    writes: Mutex<Vec<(tokio::time::Instant, Vec<u8>)>>,
+    control_sender: Mutex<Option<mpsc::Sender<ControlEvent>>>,
     opens: AtomicUsize,
     closes: AtomicUsize,
     open_mode: AtomicUsize,
@@ -16,6 +28,61 @@ struct Fake {
     sender: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
 }
 impl FtmsTransport for Fake {
+    fn write_control<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.writes
+                .lock()
+                .expect("mutex")
+                .push((tokio::time::Instant::now(), bytes.to_vec()));
+            let mode = self.reply_mode.load(SeqCst);
+            if mode == 5 {
+                return Err(BridgeError::new(
+                    ErrorCode::ConnectionFailed,
+                    "Write failed.",
+                ));
+            }
+            if mode != 1 {
+                let sender = self
+                    .control_sender
+                    .lock()
+                    .expect("mutex")
+                    .as_ref()
+                    .expect("control stream")
+                    .clone();
+                let response = vec![
+                    128,
+                    if mode == 2 {
+                        bytes[0].wrapping_add(1)
+                    } else {
+                        bytes[0]
+                    },
+                    match mode {
+                        3 => 5,
+                        4 => 4,
+                        _ => 1,
+                    },
+                ];
+                sender
+                    .send(ControlEvent::Indication(response))
+                    .await
+                    .map_err(|_| crate::session::disconnected())?;
+                if self.emit_status.load(SeqCst) {
+                    let status = match bytes[0] {
+                        8 => Some(vec![2, 1]),
+                        1 => Some(vec![1]),
+                        _ => None,
+                    };
+                    if let Some(status) = status {
+                        sender
+                            .send(ControlEvent::Status(status))
+                            .await
+                            .map_err(|_| crate::session::disconnected())?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
     fn open(&self) -> BoxFuture<'_, Result<FtmsSession>> {
         Box::pin(async move {
             self.opens.fetch_add(1, SeqCst);
@@ -32,7 +99,25 @@ impl FtmsTransport for Fake {
             }
             let (sender, receiver) = mpsc::channel(16);
             *self.sender.lock().expect("mutex") = Some(sender);
+            let control = if self.control_enabled.load(SeqCst) {
+                let (sender, receiver) = mpsc::channel(32);
+                *self.control_sender.lock().expect("mutex") = Some(sender);
+                Some(ControlSession {
+                    profile: ControlProfile::discover(
+                        &[0, 0, 0, 0, 12, 32, 0, 0],
+                        Some(&[0, 0, 232, 3, 10, 0]),
+                        Some(&[0, 0, 220, 5, 5, 0]),
+                    )
+                    .expect("profile"),
+                    events: Box::pin(stream::unfold(receiver, |mut receiver| async move {
+                        receiver.recv().await.map(|event| (event, receiver))
+                    })),
+                })
+            } else {
+                None
+            };
             Ok(FtmsSession {
+                control,
                 features: if self.open_mode.load(SeqCst) == 3 {
                     vec![0]
                 } else {
@@ -58,6 +143,7 @@ impl FtmsTransport for Fake {
             }
             self.connected.store(false, SeqCst);
             self.sender.lock().expect("mutex").take();
+            self.control_sender.lock().expect("mutex").take();
             Ok(())
         })
     }

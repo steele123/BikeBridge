@@ -13,6 +13,8 @@ max_grade_percent = 15.0
 max_resistance = 0.7
 max_resistance_change_per_second = 0.2
 smooth_resistance = true
+# Retry lost BLE links up to five times; never restore ownership or load targets.
+auto_reconnect = false
 
 [logging]
 level = "info"

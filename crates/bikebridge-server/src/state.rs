@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -24,6 +24,7 @@ pub struct AppState {
     pub(crate) shutdown: CancellationToken,
     pub(crate) sessions: TaskTracker,
     scanner: Option<Scanner>,
+    replay: Option<Arc<Mutex<crate::replay::ReplayRuntime>>>,
 }
 
 struct Inner {
@@ -31,6 +32,7 @@ struct Inner {
     mock: bool,
     clients: AtomicUsize,
     next_session: AtomicUsize,
+    next_command: AtomicU64,
     registry: Mutex<Registry>,
 }
 
@@ -58,6 +60,9 @@ pub struct Status {
     pub scan: ScanStatus,
     /// Whether mock devices are enabled.
     pub mock_mode: bool,
+    /// Present only in hardware-free replay mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay: Option<bikebridge_trace::PlaybackStatus>,
     /// Number of open WebSocket sessions.
     pub websocket_clients: usize,
     /// Number of connected devices.
@@ -74,6 +79,7 @@ impl AppState {
                 mock,
                 clients: AtomicUsize::new(0),
                 next_session: AtomicUsize::new(1),
+                next_command: AtomicU64::new(1),
                 registry: Mutex::new(Registry {
                     trainer: if mock {
                         Some(MockTrainer::new(limits)?)
@@ -88,7 +94,42 @@ impl AppState {
             shutdown: CancellationToken::new(),
             sessions: TaskTracker::new(),
             scanner: None,
+            replay: None,
         })
+    }
+
+    /// Create an isolated, paused replay daemon. This constructs no Bluetooth backend.
+    pub fn replay(trace: bikebridge_trace::Trace, speed: f64) -> anyhow::Result<Self> {
+        let mut state = Self::new(false, SafetyLimits::default())?;
+        state.replay = Some(Arc::new(Mutex::new(crate::replay::ReplayRuntime::new(
+            trace, speed,
+        )?)));
+        Ok(state)
+    }
+
+    /// Timeline state, absent during live operation.
+    pub async fn replay_status(&self) -> Option<bikebridge_trace::PlaybackStatus> {
+        match &self.replay {
+            Some(runtime) => Some(runtime.lock().await.status()),
+            None => None,
+        }
+    }
+
+    /// Start, pause, or restart the virtual timeline; never touches live devices.
+    pub async fn replay_action(&self, action: &str) -> Result<bikebridge_trace::PlaybackStatus> {
+        let runtime = self.replay.as_ref().ok_or_else(|| {
+            BridgeError::new(
+                ErrorCode::UnsupportedOperation,
+                "This daemon is not replaying a trace.",
+            )
+        })?;
+        runtime.lock().await.action(action, &self.events)
+    }
+
+    pub(crate) async fn replay_tick(&self) {
+        if let Some(runtime) = &self.replay {
+            runtime.lock().await.tick(&self.events);
+        }
     }
 
     /// Attach discovery initialized with this state's event bus.
@@ -144,6 +185,9 @@ impl AppState {
 
     /// Snapshot of all known devices.
     pub async fn devices(&self) -> Vec<DeviceInfo> {
+        if let Some(runtime) = &self.replay {
+            return runtime.lock().await.devices();
+        }
         let registry = self.inner.registry.lock().await;
         let mut devices: Vec<_> = registry
             .trainer
@@ -172,6 +216,7 @@ impl AppState {
             bluetooth_enabled: self.scanner.is_some(),
             scan: discovery.scan,
             mock_mode: self.inner.mock,
+            replay: self.replay_status().await,
             websocket_clients: self.inner.clients.load(Ordering::Relaxed),
             connected_devices: self.devices().await.iter().filter(|d| d.connected).count(),
         }
@@ -183,6 +228,11 @@ impl AppState {
     }
 
     pub(crate) async fn close_session(&self, session: usize) {
+        if self.replay.is_none() {
+            self.events.publish(Event::SessionDisconnected {
+                session_id: session as u64,
+            });
+        }
         let mut registry = self.inner.registry.lock().await;
         if registry.owner == Some(session) {
             if let Some(trainer) = &mut registry.trainer {
@@ -195,6 +245,10 @@ impl AppState {
             );
         }
         self.inner.clients.fetch_sub(1, Ordering::Relaxed);
+        drop(registry);
+        if let Some(scanner) = &self.scanner {
+            scanner.release_client(session).await;
+        }
     }
 
     /// Reset all loads before daemon teardown, including when the listener fails.
@@ -230,7 +284,7 @@ impl AppState {
         subscription: &mut Subscription,
     ) -> Result<Value> {
         if let Command::Subscribe { events, device_ids } = command {
-            if events.len() > 5
+            if events.len() > 8
                 || device_ids.len() > 64
                 || device_ids.iter().any(|id| id.is_empty() || id.len() > 128)
             {
@@ -242,33 +296,25 @@ impl AppState {
             *subscription = Subscription { events, device_ids };
             return Ok(json!({}));
         }
-        if let Some((id, _)) = command.trainer_command()
-            && self.ble_device(id).await
-        {
-            return Err(phase_four());
+        if let Some((id, operation)) = command.trainer_command() {
+            if self.replay.is_some() {
+                return Err(BridgeError::new(
+                    ErrorCode::UnsupportedOperation,
+                    "Replay is passive: recorded commands are events, and live load commands are not executed.",
+                ));
+            }
+            let mut audit = CommandAudit::start(
+                self.events.clone(),
+                self.inner.next_command.fetch_add(1, Ordering::Relaxed),
+                session,
+                id,
+                operation,
+            );
+            let result = self.execute_trainer(session, id, operation).await;
+            audit.finish(&result);
+            return result.map(|applied| json!({"applied":applied}));
         }
         let mut registry = self.inner.registry.lock().await;
-        if let Some((id, operation)) = command.trainer_command() {
-            require_trainer(&registry, id)?;
-            require_owner(&registry, session)?;
-            let trainer = registry.trainer.as_mut().ok_or_else(not_found)?;
-            let applied = match trainer.execute(operation).await {
-                Ok(applied) => applied,
-                Err(error) => {
-                    trainer.safe_state();
-                    registry.owner = None;
-                    tracing::warn!(session, code = ?error.code, "Trainer command failed; reset to safe state");
-                    return Err(error);
-                }
-            };
-            registry.owner = if matches!(operation, TrainerCommand::Reset) {
-                None
-            } else {
-                Some(session)
-            };
-            tracing::debug!(session, ?applied, "Trainer command completed");
-            return Ok(json!({"applied": applied}));
-        }
         match command {
             Command::MockTelemetry { device_id, data } => {
                 require_trainer(&registry, &device_id)?;
@@ -307,18 +353,70 @@ impl AppState {
         }
     }
 
+    async fn execute_trainer(
+        &self,
+        session: usize,
+        id: &str,
+        operation: TrainerCommand,
+    ) -> Result<TrainerCommand> {
+        if self.ble_device(id).await {
+            return self
+                .scanner
+                .as_ref()
+                .ok_or_else(not_found)?
+                .execute(session, id, operation)
+                .await;
+        }
+        let mut registry = self.inner.registry.lock().await;
+        require_trainer(&registry, id)?;
+        require_owner(&registry, session)?;
+        let trainer = registry.trainer.as_mut().ok_or_else(not_found)?;
+        let applied = match trainer.execute(operation).await {
+            Ok(applied) => applied,
+            Err(error) => {
+                trainer.safe_state();
+                registry.owner = None;
+                tracing::warn!(session, code = ?error.code, "Trainer command failed; reset to safe state");
+                return Err(error);
+            }
+        };
+        registry.owner = if matches!(operation, TrainerCommand::Reset) {
+            None
+        } else {
+            Some(session)
+        };
+        tracing::debug!(session, ?applied, "Trainer command completed");
+        Ok(applied)
+    }
+
     pub(crate) async fn set_connection(
         &self,
         session: usize,
         id: &str,
         connected: bool,
     ) -> Result<Value> {
+        if let Some(runtime) = &self.replay {
+            let device = runtime
+                .lock()
+                .await
+                .devices()
+                .into_iter()
+                .find(|d| d.id == id)
+                .ok_or_else(not_found)?;
+            if device.connected == connected {
+                return Ok(json!(device));
+            }
+            return Err(BridgeError::new(
+                ErrorCode::UnsupportedOperation,
+                "Replay connection state follows the trace timeline.",
+            ));
+        }
         if self.ble_device(id).await {
             return self
                 .scanner
                 .as_ref()
                 .ok_or_else(not_found)?
-                .set_connection(id, connected)
+                .set_connection_for(session, id, connected)
                 .await
                 .map(|data| json!(data));
         }
@@ -391,9 +489,57 @@ pub(crate) fn not_found() -> BridgeError {
     BridgeError::new(ErrorCode::DeviceNotFound, "Device not found.")
 }
 
-fn phase_four() -> BridgeError {
-    BridgeError::new(
-        ErrorCode::UnsupportedOperation,
-        "BLE trainer control arrives in Phase 4. Phase 3 provides read-only FTMS telemetry.",
-    )
+// Drop covers futures cancelled by socket closure or shutdown, preserving uncertain outcomes.
+struct CommandAudit {
+    events: EventBus,
+    id: u64,
+    device: String,
+    finished: bool,
+}
+impl CommandAudit {
+    fn start(
+        events: EventBus,
+        id: u64,
+        session: usize,
+        device: &str,
+        command: TrainerCommand,
+    ) -> Self {
+        events.publish(Event::CommandStarted {
+            command_id: id,
+            session_id: session as u64,
+            device_id: device.into(),
+            command,
+        });
+        Self {
+            events,
+            id,
+            device: device.into(),
+            finished: false,
+        }
+    }
+    fn finish(&mut self, result: &Result<TrainerCommand>) {
+        let outcome = match result {
+            Ok(command) => CommandOutcome::Applied { command: *command },
+            Err(error) => CommandOutcome::Failed {
+                error: error.clone(),
+            },
+        };
+        self.events.publish(Event::CommandFinished {
+            command_id: self.id,
+            device_id: self.device.clone(),
+            outcome,
+        });
+        self.finished = true;
+    }
+}
+impl Drop for CommandAudit {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.events.publish(Event::CommandFinished {
+                command_id: self.id,
+                device_id: self.device.clone(),
+                outcome: CommandOutcome::Cancelled,
+            });
+        }
+    }
 }

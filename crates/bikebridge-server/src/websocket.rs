@@ -69,17 +69,17 @@ async fn run_session(socket: &mut WebSocket, state: &AppState, session: usize) {
     // Prevent a local client from flooding commands indefinitely.
     let mut window = Instant::now();
     let mut commands = 0u16;
-    let mut pending_connection: Option<BoxFuture<'static, protocol::Response>> = None;
+    let mut pending_operation: Option<BoxFuture<'static, protocol::Response>> = None;
     loop {
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
             response = async {
-                match &mut pending_connection {
+                match &mut pending_operation {
                     Some(pending) => pending.await,
                     None => std::future::pending().await,
                 }
             } => {
-                pending_connection = None;
+                pending_operation = None;
                 if !send(socket,&response).await {break;}
             }
             _ = heartbeat.tick() => {
@@ -95,15 +95,26 @@ async fn run_session(socket: &mut WebSocket, state: &AppState, session: usize) {
                         if commands > 100 { break; }
                         let (id, decoded) = protocol::decode(&text);
                         if let Ok(Command::Connect {device_id} | Command::Disconnect {device_id}) = &decoded {
-                            if pending_connection.is_some() {
-                                let error = BridgeError::new(ErrorCode::Busy,"A connection request is already pending on this WebSocket.");
+                            if pending_operation.is_some() {
+                                let error = BridgeError::new(ErrorCode::Busy,"A device operation is already pending on this WebSocket.");
                                 if !send(socket,&protocol::Response::new(id,Err(error))).await {break;}
                             } else {
                                 let connected = matches!(decoded,Ok(Command::Connect {..}));
                                 let device_id = device_id.clone();
                                 let state = state.clone();
-                                pending_connection = Some(Box::pin(async move {
+                                pending_operation = Some(Box::pin(async move {
                                     protocol::Response::new(id,state.set_connection(session,&device_id,connected).await)
+                                }));
+                            }
+                            continue;
+                        }
+                        if decoded.as_ref().is_ok_and(|command|command.trainer_command().is_some()) {
+                            if pending_operation.is_some() {
+                                if !send(socket,&protocol::Response::new(id,Err(BridgeError::new(ErrorCode::Busy,"A device operation is already pending on this WebSocket.")))).await {break;}
+                            } else if let Ok(command)=decoded {
+                                let state=state.clone();
+                                pending_operation=Some(Box::pin(async move {
+                                    protocol::Response::new(id,state.execute(session,command,&mut Subscription::default()).await)
                                 }));
                             }
                             continue;

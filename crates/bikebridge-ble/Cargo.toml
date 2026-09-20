@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bikebridge-openbikecontrol.workspace = true
 bikebridge-core.workspace = true
 btleplug.workspace = true
 futures-util.workspace = true

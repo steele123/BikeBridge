@@ -1,6 +1,7 @@
 //! BikeBridge HTTP/WebSocket transport for BLE discovery and optional mock devices.
 pub mod api;
 pub mod protocol;
+mod replay;
 pub mod state;
 mod websocket;
 
@@ -43,6 +44,8 @@ async fn local_only(State(port): State<u16>, request: Request, next: Next) -> Re
 pub fn router(state: AppState, port: u16) -> Router {
     Router::new()
         .route("/api/status", get(api::status))
+        .route("/api/replay", get(api::replay_status))
+        .route("/api/replay/{action}", post(api::replay_action))
         .route("/api/adapters", get(api::adapters))
         .route("/api/scan/start", post(api::scan_start))
         .route("/api/scan/stop", post(api::scan_stop))
@@ -85,6 +88,20 @@ pub async fn serve(
             }
         }
     });
+    let replay_state = state.clone();
+    let replay_worker = tokio::spawn(async move {
+        if replay_state.replay_status().await.is_none() {
+            return;
+        }
+        let mut interval = tokio::time::interval(Duration::from_millis(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = replay_state.shutdown.cancelled() => break,
+                _ = interval.tick() => replay_state.replay_tick().await,
+            }
+        }
+    });
     let stop_state = state.clone();
     let result = axum::serve(listener, router(state.clone(), address.port()))
         .with_graceful_shutdown(async move {
@@ -100,5 +117,6 @@ pub async fn serve(
     state.sessions.close();
     state.sessions.wait().await;
     let _ = ticker.await;
+    let _ = replay_worker.await;
     result
 }

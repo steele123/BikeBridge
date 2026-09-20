@@ -1,7 +1,10 @@
-//! Service-only detection using Bluetooth SIG Assigned Numbers.
+//! Service-only detection using Bluetooth SIG and OpenBikeControl assigned UUIDs.
 //! https://www.bluetooth.com/specifications/assigned-numbers/
 use bikebridge_core::DeviceKind;
 use uuid::Uuid;
+
+/// OpenBikeControl bridge service (distinct from proprietary Zwift services).
+pub const OPEN_BIKE_CONTROL: Uuid = bikebridge_openbikecontrol::SERVICE;
 
 /// Standard Fitness Machine Service (not necessarily an indoor bike).
 pub const FITNESS_MACHINE: Uuid = bluetooth_uuid(0x1826);
@@ -23,6 +26,7 @@ pub fn cycling_services() -> Vec<Uuid> {
         CYCLING_POWER,
         HEART_RATE,
         CYCLING_SPEED_CADENCE,
+        OPEN_BIKE_CONTROL,
     ]
 }
 
@@ -31,6 +35,8 @@ pub fn cycling_services() -> Vec<Uuid> {
 pub fn classify(services: &[Uuid]) -> Option<DeviceKind> {
     if services.contains(&FITNESS_MACHINE) {
         Some(DeviceKind::Trainer)
+    } else if services.contains(&OPEN_BIKE_CONTROL) {
+        Some(DeviceKind::BikeController)
     } else if services.contains(&CYCLING_POWER) {
         Some(DeviceKind::PowerMeter)
     } else if services.contains(&CYCLING_SPEED_CADENCE) {
@@ -65,6 +71,7 @@ mod tests {
         );
         for (service, kind) in [
             (FITNESS_MACHINE, DeviceKind::Trainer),
+            (OPEN_BIKE_CONTROL, DeviceKind::BikeController),
             (CYCLING_POWER, DeviceKind::PowerMeter),
             (HEART_RATE, DeviceKind::HeartRateMonitor),
             (CYCLING_SPEED_CADENCE, DeviceKind::CadenceSensor),

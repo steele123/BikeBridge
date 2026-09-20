@@ -5,10 +5,11 @@ It handles Bluetooth and cycling protocols so your application doesn't have to.
 
 **Smart trainer → BikeBridge → your app.**
 
-This repository implements **Phases 1–3**: a native Rust daemon, normalized
-models, mock trainer/controller, BLE discovery, FTMS connections and telemetry,
-and an HTTP/WebSocket API. Physical trainer acceptance testing is still pending.
-Real trainer control, OpenBikeControl, and SDK packages are upcoming;
+This repository implements **Phases 1–4**: a native Rust daemon, normalized
+models, mock trainer/controller, BLE discovery, FTMS telemetry and control,
+and an HTTP/WebSocket API. Recorder/replay adds shareable `.biketrace` sessions. Physical trainer acceptance testing is still pending.
+OpenBikeControl BLE inputs are implemented through the BikeControl bridge;
+SDK packages are upcoming;
 version `0.1.0` is a development version, not a claim that the complete v0.1
 hardware acceptance criteria have been met.
 
@@ -125,8 +126,68 @@ old values. See [FTMS decoding and limitations](docs/ftms.md).
 
 BLE sessions are process-wide: closing a viewer or stopping discovery leaves a
 connected trainer available to other clients. Explicit disconnect, link loss,
-or daemon shutdown ends the session. Reconnect explicitly after a lost link.
-Trainer control writes remain scheduled for Phase 4.
+or daemon shutdown ends the session. Reconnect explicitly after a lost link, or
+enable `[trainer].auto_reconnect` for bounded retries without restoring targets.
+
+## Control a trainer
+
+```sh
+node examples/javascript/control.mjs ble-<your-device-id>
+# Or mock-trainer when the daemon runs in --mock mode.
+```
+
+The interactive client connects and requests control. Enter `start`,
+`resistance 0.1`, `erg 150`, `grade 2`, `stop`, `reset`, or `quit`. Commands require
+the corresponding verified capability. Closing the owner attempts Stop/Reset
+and disconnects its BLE trainer. See [FTMS control](docs/ftms-control.md) for
+acknowledgements, range mapping, smoothing, and physical validation limits.
+
+## Zwift, Shimano Di2, and SRAM AXS inputs
+
+Pair supported Click/Play/Ride, Di2, or AXS controllers in BikeControl on a phone
+or second computer. Select
+**OpenBikeControl Compatible** and enable **Connect using Bluetooth**. BikeBridge
+receives that BLE bridge:
+
+```sh
+bikebridge run --record controllers.biketrace
+# In another terminal, find the BikeControl bridge ID:
+bikebridge devices
+node examples/javascript/controller.mjs ble-<bridge-id>
+```
+
+Shifting, steering buttons, confirm/back, brake values, and other mapped actions
+become normal `input` events and can be recorded/replayed. Link loss releases held
+inputs and attempts bounded reconnection. This requires BikeControl; proprietary
+Zwift, Di2, and AXS pairing is not implemented inside BikeBridge. Physical controller
+validation is pending. See [bridge setup](docs/zwift-controllers.md) and
+[Di2 / AXS setup and synthetic replay demos](docs/di2-axs.md). Di2 uses D-Fly channel
+assignments; AXS uses BikeControl 6.3+ and its button setup/restore flow.
+
+## Record and replay a bug
+
+Capture telemetry, shifting/input events, trainer commands and outcomes, and
+disconnects, then reproduce the API timeline without hardware:
+
+```sh
+bikebridge run --record kickr-core-click-v2.biketrace
+# Stop with Ctrl+C to finalize. Add --mock to record without hardware.
+bikebridge trace-info kickr-core-click-v2.biketrace
+bikebridge replay kickr-core-click-v2.biketrace --speed 1
+```
+
+Replay starts paused. Connect your app and subscribe, then use
+`bikebridge replay-control start`. `pause` freezes time; `restart` rewinds.
+Recorded commands are events, never hardware writes. Existing files are not
+overwritten and incomplete traces are rejected. Try the included mock trace:
+
+```sh
+bikebridge replay examples/traces/demo-ride.biketrace
+node examples/javascript/replay.mjs
+```
+
+See [Recorder / Replay](docs/recorder-replay.md) for the format, timing, HTTP
+controls, and the distinction between API-event replay and BLE emulation.
 
 ## Build a native executable
 
@@ -222,14 +283,17 @@ cargo run -p bikebridge-cli -- run --mock --port 9380 --log-level debug
 Commands clamp ERG power (default 800 W), absolute grade (15%), and normalized
 resistance (0.7). Non-finite values and malformed messages are rejected.
 Resistance transitions are smoothed at 0.2 units/second by default; resets remove
-load immediately. Command responses report the effective values.
+mock load immediately. BLE commands use advertised ranges and supported increments.
+Responses report quantized targets; a smoothed resistance target completes asynchronously.
 
 The first successful control command acquires session ownership. Other clients
 can observe telemetry but cannot change that trainer until its owner resets or
 disconnects. Owner disconnect, control execution failure, device disconnect, and
-daemon shutdown clear the simulated load. Idle broken connections are detected
-using WebSocket ping/pong. These are mock semantics, not validated physical-device
-safety guarantees; real hardware fail-safe behavior belongs in the BLE phase.
+daemon shutdown clear simulated load and attempt acknowledged Stop/Reset on a
+synchronized BLE channel before disconnecting. Lost links or uncertain transactions
+can prevent cleanup writes. Physical fail-safe behavior remains unverified. Idle
+broken WebSockets are detected by ping/pong. Optional automatic trainer reconnection
+retries up to five times and never restores ownership or previous load targets.
 
 Only loopback addresses are supported. Browser `Origin` headers are rejected,
 including WebSocket upgrades; use native clients or Node.js. No CORS is enabled,
@@ -246,10 +310,12 @@ there is no authentication or remote-access mode.
 │   ├── bikebridge-core/src/
 │   │   ├── lib.rs / device.rs / discovery.rs / telemetry.rs / input.rs
 │   │   └── command.rs / trainer.rs / event.rs / error.rs
+│   ├── bikebridge-openbikecontrol/src/lib.rs / protocol.rs / connection.rs
+│   ├── bikebridge-trace/src/lib.rs / recording.rs / playback.rs
 │   ├── bikebridge-mock/src/lib.rs
 │   ├── bikebridge-ble/
 │   │   ├── src/lib.rs / backend.rs / classification.rs / registry.rs / scanner.rs
-│   │   ├── src/transport.rs / connection.rs / connection_tests.rs / ftms.rs
+│   │   ├── src/transport.rs / connection.rs / session.rs / control.rs / ftms.rs
 │   │   └── tests/discovery.rs
 │   ├── bikebridge-server/
 │   │   ├── src/lib.rs / state.rs / protocol.rs / websocket.rs / api.rs
@@ -257,8 +323,9 @@ there is no authentication or remote-access mode.
 │   └── bikebridge-cli/src/main.rs / config.rs
 ├── examples/
 │   ├── rust-console/Cargo.toml / src/main.rs
-│   └── javascript/client.mjs / discover.mjs / trainer.mjs
-├── docs/architecture.md / protocol.md / devices.md / ftms.md
+│   └── javascript/client.mjs / discover.mjs / trainer.mjs / control.mjs / replay.mjs / controller.mjs
+├── docs/architecture.md / protocol.md / devices.md / ftms.md / ftms-control.md
+│   / recorder-replay.md / zwift-controllers.md / di2-axs.md
 └── .github/workflows/ci.yml
 ```
 
@@ -289,6 +356,11 @@ cleanup, and real HTTP/WebSocket delivery of discovery events.
 FTMS tests cover all 8,192 flag combinations, truncated packets, signed fields,
 record assembly, setup deadlines, link loss, cancellation, teardown failures,
 manual reconnection, and encoded measurements delivered through real WebSockets.
+Control tests cover encoding, capability/range checks, ownership, clamping, ramps,
+acknowledgements, cancellation, cleanup, and bounded reconnects. Recorder/replay
+tests verify ordering, timestamps, file validation, and WebSocket equivalence.
+Controller tests cover rapid edges, partial updates, disconnect releases, retries,
+and the path from injected notification bytes to WebSocket, recording, and replay.
 
 GitHub Actions runs these checks on Windows, Ubuntu, and macOS and uploads native
 daemon artifacts. The workflow must be run in a GitHub repository to validate those
@@ -304,8 +376,8 @@ platforms; adding it is not evidence that all platforms have passed.
 
 Real BLE discovery and MockTrainer/MockController are implemented. The mock trainer
 includes a simulated heart-rate field; a standalone MockHeartRateMonitor is deferred.
-FTMS telemetry is implemented but has not yet been validated with a physical trainer.
-Real control is deferred. See [devices](docs/devices.md).
+FTMS telemetry/control and OpenBikeControl bridge inputs are implemented; physical
+trainer and controller validation remains pending. See [devices](docs/devices.md).
 
 ## Roadmap
 
@@ -316,11 +388,13 @@ Real control is deferred. See [devices](docs/devices.md).
    discovery events, HTTP scan operations, and CLI integration.
 3. **Phase 3 — implemented, hardware validation pending:** Bluetooth SIG FTMS parsers,
    explicit connections, subscriptions, telemetry, and disconnect cleanup.
-4. **Phase 4:** advertised feature/range checks, FTMS control-point transactions,
+4. **Phase 4 — implemented, hardware validation pending:** advertised feature/range checks, FTMS control-point transactions,
    device-specific safety mapping, disconnect handling, and bounded reconnection.
 5. **Phase 5:** heart rate, power, and CSC sensors, rollover tests, preferred roles,
    and lightweight persistence.
-6. **Phase 6:** optional verified OpenBikeControl integration and normalized inputs.
+6. **Phase 6 — BLE bridge implemented, hardware validation pending:** OpenBikeControl
+   input via BikeControl, connection lifecycle, normalized events, and recorder/replay.
+   Network transport and direct proprietary pairing are deferred.
 7. **Phase 7:** C#, TypeScript, and Unity SDKs and examples; expand native packaging.
 
 No cloud service, GUI, proprietary protocol, ANT+, or game is included.
