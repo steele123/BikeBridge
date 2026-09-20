@@ -1,0 +1,23 @@
+[package]
+name = "ride-along"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "An always-on-top ride companion for BikeBridge"
+
+# Desktop packaging has its own lockfile and native prerequisites.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["time", "net", "sync", "macros"] }
+tokio-tungstenite = "0.30"
+futures-util = { version = "0.3", features = ["sink"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSWindow"] }

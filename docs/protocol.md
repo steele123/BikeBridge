@@ -1,6 +1,6 @@
 # BikeBridge protocol v1
 
-Connect a native client to `ws://127.0.0.1:9376/ws`. UTF-8 JSON text frames only.
+Connect a client to `ws://127.0.0.1:9376/ws`. UTF-8 JSON text frames only.
 The daemon sends `hello` before any other application message:
 
 ```json
@@ -9,9 +9,45 @@ The daemon sends `hello` before any other application message:
 
 Clients should check `protocolVersion`, ignore unfamiliar additive event fields,
 and implement WebSocket ping/pong (most WebSocket libraries do this automatically).
-Browser-origin requests are not enabled. Node's built-in WebSocket is supported.
+The dashboard served at `/` uses this same API. Browser requests must have the
+exact same HTTP origin as the daemon (including host and port); foreign and null
+origins are rejected. Native clients without an Origin header and Node's built-in
+WebSocket are supported.
+
+### Select a discovery name
+
+`POST /api/scan/select` accepts `{"name":"Steele's Bike"}` and returns the scan
+status. The name must contain 1–128 UTF-8 bytes after trimming, with no control
+characters. This adds a name for the current daemon session and restarts scanning
+without service filters. Only recognized cycling devices, identified Click V2
+controllers, and explicitly selected names appear in discovery results. Matching ignores case, surrounding whitespace,
+and straight/curly apostrophe differences. Selection does not connect the device
+or grant capabilities. Persist names with `[bluetooth].device_names` in the daemon
+configuration. Mock/replay modes do not support Bluetooth name selection.
 
 ## Requests and responses
+
+### Nearby Bluetooth browser
+
+`GET /api/scan/nearby` returns a cached array with `id`, `name` (nullable),
+`signalStrength` (nullable), and `deviceId` (nullable). The `nearby-…` selection ID
+is opaque and session-scoped; `deviceId` links to `/api/devices` when a result is
+already recognized or explicitly selected. This includes unrelated/unsupported
+Bluetooth devices. It does not expose addresses or raw manufacturer payloads.
+
+`POST /api/scan/nearby/{id}/select` with an empty body selects exactly that result
+and starts scanning if necessary, returning scan status. It does not connect or
+grant capabilities. Unlike name selection, it distinguishes duplicate and unnamed
+devices. Unknown IDs return 404 without interrupting scanning. Selection lasts
+until daemon shutdown.
+
+Results are bounded to 1024 cached identities, updated while scanning, and retained
+when scanning stops. OS advertisement caches can retain devices that are no longer
+nearby; no last-seen timestamp is claimed. Names/RSSI survive partial updates.
+Mock/replay sessions return an empty list and do not support selection. The same
+loopback/same-origin restrictions apply as for the rest of the API.
+
+### Command envelopes
 
 Every command has `type`. A `requestId` is optional; when present it must be a
 nonempty string of at most 128 UTF-8 bytes. Every command gets a `response`, even
@@ -89,6 +125,14 @@ and feature-confirmed `power`, `cadence`, or `heart_rate`. With a usable Control
 and Machine Status channel, supported target bits and valid ranges add
 `resistance_control`, `erg_control`, or `simulation_control`. HTTP `POST /api/devices/{id}/connect` and `/disconnect` perform
 the same operation with an empty body and return DeviceInfo directly.
+
+Manually named candidates may initially have `kind: "unknown"` and no capabilities.
+Connection verifies their GATT services. If FTMS Indoor Bike Data is unavailable,
+the driver accepts readable Cycling Power Feature and notifying Cycling Power
+Measurement under service `0x1818`. A successful Cycling Power connection reports
+`kind: "power_meter"`, `power`, and optional `cadence`, with no trainer control
+capabilities. CLI name selection resolves to the existing opaque ID, so the wire
+commands are unchanged.
 
 ```json
 {"type":"device.connect","requestId":"connect-1","deviceId":"ble-<opaque-uuid>"}
@@ -260,6 +304,12 @@ resistance is not published as normalized `resistanceLevel`. Invalid packets are
 dropped; `invalid_device_data` is emitted at most once every five seconds per device.
 See [field layout and record assembly](ftms.md).
 
+Cycling Power uses the same `telemetry` envelope with signed `powerWatts` and
+optional `cadenceRpm` derived from crank revolution counters. It does not invent
+speed or resistance. The initial crank sample establishes a baseline; unchanged
+counts report zero cadence after three seconds of continued notifications.
+Malformed packets use the same rate-limited `invalid_device_data` error policy.
+
 ## Mock controls
 
 Override any subset of measurements:
@@ -359,3 +409,12 @@ cancels retries. Unexpected link loss emits releases for held inputs, a disconne
 and up to five `device.reconnecting` attempts. Protocol errors close the session
 without retry. Read [Zwift controller integration](zwift-controllers.md) for mappings,
 BikeControl setup, aggregate identity, and hardware validation limits.
+
+## Direct Click V2 inputs
+
+Identified Click V2 devices use `kind: "bike_controller"` and gain
+`controller_input` after GATT and handshake verification. They emit the same
+`input` envelope as the OpenBikeControl bridge. See [button mappings, setup, and
+firmware limitations](zwift-click-v2.md). Discovery does not depend on display
+names and does not expose raw manufacturer data. Automatic retries never resend
+trainer commands; controller inputs never acquire a trainer-control lease.

@@ -1,10 +1,10 @@
 //! OpenBikeControl BLE input bridge, independently implemented from the public protocol.
-//! Zwift controllers are paired by BikeControl; this crate consumes its normalized bridge.
+//! The shared controller worker also accepts native decoders through ControllerTransport.
 mod connection;
 pub mod protocol;
 pub use connection::Controllers;
 
-use bikebridge_core::Result;
+use bikebridge_core::{InputData, Result};
 use futures_util::{future::BoxFuture, stream::BoxStream};
 use uuid::Uuid;
 
@@ -19,6 +19,11 @@ pub const APP_INFO: Uuid = Uuid::from_u128(0xd273f683_d548_419d_b9d1_fa047234522
 pub trait ControllerTransport: Send + Sync + 'static {
     /// Connect, verify service/properties, subscribe, and send app information.
     fn open(&self) -> BoxFuture<'_, Result<BoxStream<'static, Vec<u8>>>>;
+    /// Decode a complete notification into partial normalized input updates.
+    /// The shared worker validates, deduplicates, and releases held actions on disconnect.
+    fn decode(&self, bytes: &[u8]) -> Result<Vec<InputData>> {
+        protocol::decode_packet(bytes)
+    }
     /// Check the platform connection state; silence alone is not disconnection.
     fn is_connected(&self) -> BoxFuture<'_, Result<bool>>;
     /// Release the BLE session, also after failed/cancelled setup.

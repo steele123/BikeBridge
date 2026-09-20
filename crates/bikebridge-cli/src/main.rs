@@ -52,6 +52,10 @@ enum Commands {
         /// Zero-based adapter index; defaults to the first powered-on adapter.
         #[arg(long)]
         adapter_index: Option<usize>,
+        /// Include a device by its full Bluetooth name even without advertised cycling services.
+        /// Repeat for multiple devices. Connection still requires an explicit connect command.
+        #[arg(long)]
+        device_name: Vec<String>,
         /// Record the entire daemon session to a new .biketrace file.
         #[arg(long)]
         record: Option<PathBuf>,
@@ -80,10 +84,10 @@ enum Commands {
     Status,
     /// List devices from the running daemon.
     Devices,
-    /// Connect a discovered FTMS trainer or OpenBikeControl bridge by its device ID.
-    Connect { device_id: String },
-    /// Disconnect a device using its BikeBridge device ID.
-    Disconnect { device_id: String },
+    /// Connect a discovered FTMS trainer, Cycling Power sensor, or OpenBikeControl bridge.
+    Connect(DeviceSelector),
+    /// Disconnect a device by its BikeBridge ID or full name.
+    Disconnect(DeviceSelector),
     /// List Bluetooth adapters from the running daemon.
     Adapters,
     /// Start the daemon's continuous BLE scan (use --stop to stop it).
@@ -92,6 +96,30 @@ enum Commands {
         #[arg(long)]
         stop: bool,
     },
+}
+
+#[derive(clap::Args)]
+struct DeviceSelector {
+    /// Opaque ID from the devices command.
+    #[arg(required_unless_present = "name", conflicts_with = "name")]
+    device_id: Option<String>,
+    /// Full device name; duplicate matches require an ID instead.
+    #[arg(long, conflicts_with = "device_id")]
+    name: Option<String>,
+}
+
+fn id_for_name(devices: &[bikebridge_core::DeviceInfo], name: &str) -> Result<String> {
+    let matches: Vec<_> = devices
+        .iter()
+        .filter(|device| bikebridge_ble::backend::device_name_matches(name, &device.name))
+        .collect();
+    match matches.as_slice() {
+        [device] => Ok(device.id.clone()),
+        [] => bail!(
+            "No discovered device named {name:?}. Wake it and start the daemon with --device-name {name:?}, then check `devices`."
+        ),
+        _ => bail!("Multiple devices match {name:?}. Use a device ID from `devices` instead."),
+    }
 }
 
 #[tokio::main]
@@ -120,9 +148,12 @@ async fn main() -> Result<()> {
             mock,
             no_auto_scan,
             adapter_index,
+            device_name,
             record,
             duration,
         } => {
+            config.bluetooth.device_names.extend(device_name);
+            config.validate()?;
             if let Some(seconds) = duration
                 && (!seconds.is_finite() || !(0.1..=604800.0).contains(&seconds))
             {
@@ -149,7 +180,7 @@ async fn main() -> Result<()> {
             };
             if !mock {
                 let scanner = Scanner::spawn_configured(
-                    NativeBackend::default(),
+                    NativeBackend::with_device_names(config.bluetooth.device_names),
                     state.events.clone(),
                     adapter_index.or(config.bluetooth.adapter_index),
                     config.trainer,
@@ -172,7 +203,7 @@ async fn main() -> Result<()> {
                 println!("Connected: mock-trainer, mock-controller");
             } else {
                 println!(
-                    "BLE discovery enabled. Use `bikebridge devices`, then `bikebridge connect <device-id>` for FTMS telemetry or OpenBikeControl inputs."
+                    "BLE discovery enabled. Use `bikebridge devices`, then `bikebridge connect <device-id>` or `connect --name <name>` for telemetry or controller inputs."
                 );
             }
             serve_daemon(listener, state, recorder, duration).await?;
@@ -211,7 +242,18 @@ async fn main() -> Result<()> {
         }
         Commands::Status => print_endpoint(address, "GET", "/api/status").await?,
         Commands::Devices => print_endpoint(address, "GET", "/api/devices").await?,
-        Commands::Connect { ref device_id } | Commands::Disconnect { ref device_id } => {
+        Commands::Connect(ref selection) | Commands::Disconnect(ref selection) => {
+            let device_id = match (&selection.device_id, &selection.name) {
+                (Some(id), _) => id.clone(),
+                (_, Some(name)) => {
+                    let devices = request_endpoint(address, "GET", "/api/devices").await?;
+                    id_for_name(
+                        &serde_json::from_value::<Vec<bikebridge_core::DeviceInfo>>(devices)?,
+                        name,
+                    )?
+                }
+                _ => bail!("Provide a device ID or --name."),
+            };
             // IDs are opaque path segments, never arbitrary URLs or HTTP request text.
             if device_id.is_empty()
                 || device_id.len() > 128
@@ -221,7 +263,7 @@ async fn main() -> Result<()> {
             {
                 bail!("Invalid device ID. Copy the id from `bikebridge devices`.");
             }
-            let action = if matches!(cli.command, Commands::Connect { .. }) {
+            let action = if matches!(cli.command, Commands::Connect(_)) {
                 "connect"
             } else {
                 "disconnect"
@@ -315,6 +357,16 @@ async fn shutdown_signal() -> std::io::Result<()> {
 // Tiny bounded HTTP/1.0 client for the daemon's JSON snapshot and scan endpoints.
 // Avoid pulling a general-purpose HTTP/TLS stack into a local CLI.
 async fn print_endpoint(address: SocketAddr, method: &str, path: &str) -> Result<()> {
+    let value = request_endpoint(address, method, path).await?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+async fn request_endpoint(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+) -> Result<serde_json::Value> {
     let response = tokio::time::timeout(Duration::from_secs(30), async {
         let mut stream = TcpStream::connect(address)
             .await
@@ -345,6 +397,37 @@ async fn print_endpoint(address: SocketAddr, method: &str, path: &str) -> Result
         bail!("API request failed: {body}");
     }
     let value: serde_json::Value = serde_json::from_str(body).context("Malformed API JSON")?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
-    Ok(())
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn name_selection_is_exact_handles_apostrophes_and_rejects_ambiguity() {
+        let bike = bikebridge_core::DeviceInfo {
+            id: "ble-one".into(),
+            name: "Steele’s Bike".into(),
+            kind: bikebridge_core::DeviceKind::Unknown,
+            transport: "bluetooth".into(),
+            connected: false,
+            signal_strength: None,
+            capabilities: vec![],
+        };
+        assert_eq!(
+            id_for_name(std::slice::from_ref(&bike), "  STEELE'S BIKE  ").expect("match"),
+            "ble-one"
+        );
+        assert!(id_for_name(std::slice::from_ref(&bike), "Bike").is_err());
+        assert!(id_for_name(std::slice::from_ref(&bike), "").is_err());
+        let mut duplicate = bike.clone();
+        duplicate.id = "ble-two".into();
+        assert!(id_for_name(&[bike, duplicate], "Steele's Bike").is_err());
+        assert!(Cli::try_parse_from(["bikebridge", "connect", "--name", "Steele's Bike"]).is_ok());
+        assert!(Cli::try_parse_from(["bikebridge", "connect", "ble-one"]).is_ok());
+        assert!(Cli::try_parse_from(["bikebridge", "connect"]).is_err());
+        assert!(
+            Cli::try_parse_from(["bikebridge", "connect", "ble-one", "--name", "Bike"]).is_err()
+        );
+    }
 }

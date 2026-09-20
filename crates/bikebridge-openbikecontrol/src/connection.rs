@@ -248,7 +248,7 @@ impl Worker {
                         Some(bytes)=>{
                             if rate_window.elapsed()>=Duration::from_secs(1) {rate_window=Instant::now();packets=0;}
                             packets+=1;
-                            let result=if packets>1000 {Err(BridgeError::new(ErrorCode::InvalidDeviceData,"Controller exceeded the input packet rate limit."))} else {self.inputs.packet(&bytes)};
+                            let result=if packets>1000 {Err(BridgeError::new(ErrorCode::InvalidDeviceData,"Controller exceeded the input packet rate limit."))} else {self.transport.decode(&bytes).and_then(|data| self.inputs.update(data))};
                             match result {
                                 Ok(data)=>self.emit(data).await,
                                 Err(error)=>{self.bus.publish(Event::Error {data:error});let _=self.close().await;retry=None;}
@@ -272,7 +272,7 @@ impl Worker {
 fn disconnected() -> BridgeError {
     BridgeError::new(
         ErrorCode::DeviceDisconnected,
-        "OpenBikeControl connection is unavailable.",
+        "Controller connection is unavailable.",
     )
 }
 async fn bounded<T>(seconds: u64, future: impl Future<Output = Result<T>>) -> Result<T> {
@@ -281,7 +281,7 @@ async fn bounded<T>(seconds: u64, future: impl Future<Output = Result<T>>) -> Re
         .map_err(|_| {
             BridgeError::new(
                 ErrorCode::Timeout,
-                "OpenBikeControl transport operation timed out.",
+                "Controller transport operation timed out.",
             )
         })?
 }

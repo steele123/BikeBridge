@@ -1,7 +1,6 @@
 use crate::{
-    ftms::decode_features,
     session::{ActiveSession, SessionEvent},
-    transport::FtmsTransport,
+    transport::{FtmsTransport, TelemetryFormat},
 };
 use bikebridge_core::{
     BridgeError, DeviceInfo, ErrorCode, Event, EventBus, Result, SafetyLimits, TrainerCommand,
@@ -78,6 +77,7 @@ impl Connections {
         if let Some(entry) = self.entries.read().await.get(&info.id) {
             let current = entry.info.read().await;
             info.connected = current.connected;
+            info.kind = current.kind;
             info.capabilities.clone_from(&current.capabilities);
         }
     }
@@ -89,6 +89,7 @@ impl Connections {
             // a stale advertisement must never follow a newer connection transition.
             let current = entry.info.read().await;
             data.connected = current.connected;
+            data.kind = current.kind;
             data.capabilities.clone_from(&current.capabilities);
             self.bus.publish(event);
         } else {
@@ -114,7 +115,7 @@ impl Connections {
             let entry = entries.get_mut(id).ok_or_else(|| {
                 BridgeError::new(
                     ErrorCode::UnsupportedOperation,
-                    "Only discovered FTMS indoor bikes can connect.",
+                    "Only FTMS indoor bikes, Cycling Power sensors, or manually selected candidates can connect here.",
                 )
             })?;
             if entry.commands.is_none() {
@@ -259,11 +260,24 @@ struct WorkerContext {
 impl WorkerContext {
     async fn open(&self) -> Result<ActiveSession> {
         let io = bounded(10, self.transport.open()).await?;
-        let mut capabilities = decode_features(&io.features)?;
+        let (mut capabilities, kind) = match io.format {
+            TelemetryFormat::Ftms => (
+                crate::ftms::decode_features(&io.features)?,
+                bikebridge_core::DeviceKind::Trainer,
+            ),
+            TelemetryFormat::CyclingPower => (
+                crate::cycling_power::decode_features(&io.features)?,
+                bikebridge_core::DeviceKind::PowerMeter,
+            ),
+        };
         if let Some(control) = &io.control {
             capabilities.extend(control.profile.capabilities(self.limits));
         }
-        self.info.write().await.capabilities = capabilities;
+        {
+            let mut info = self.info.write().await;
+            info.capabilities = capabilities;
+            info.kind = kind;
+        }
         let id = self.info.read().await.id.clone();
         Ok(ActiveSession::new(
             io,

@@ -163,6 +163,36 @@ impl AppState {
         }
     }
 
+    /// Cached Bluetooth results, including devices whose cycling support is unknown.
+    pub async fn nearby_devices(&self) -> Vec<bikebridge_core::NearbyDevice> {
+        match &self.scanner {
+            Some(scanner) => scanner.snapshot().await.nearby,
+            None => Vec::new(),
+        }
+    }
+
+    /// Select exactly one peripheral from the nearby scan results.
+    pub async fn select_nearby_device(&self, id: String) -> Result<ScanStatus> {
+        let scanner = self.scanner.as_ref().ok_or_else(|| {
+            BridgeError::new(
+                ErrorCode::BluetoothUnavailable,
+                "Bluetooth discovery is not enabled in this session.",
+            )
+        })?;
+        scanner.select_device(id).await
+    }
+
+    /// Include a full Bluetooth name in discovery for this daemon session.
+    pub async fn select_device_name(&self, name: String) -> Result<ScanStatus> {
+        let scanner = self.scanner.as_ref().ok_or_else(|| {
+            BridgeError::new(
+                ErrorCode::BluetoothUnavailable,
+                "Bluetooth discovery is not enabled in this session.",
+            )
+        })?;
+        scanner.select_name(name).await
+    }
+
     /// Stop and join the discovery actor during daemon shutdown.
     pub async fn shutdown_discovery(&self) {
         if let Some(scanner) = &self.scanner {

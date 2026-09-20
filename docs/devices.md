@@ -42,10 +42,13 @@ an indoor bike, and CSC may be wheel-only or crank-only. Every BLE discovery has
 empty capability list until connection/GATT feature verification. Detection
 does not imply support for ERG, resistance, simulation, or any measurement field.
 
-The application applies both an OS service filter and post-filtering. Some devices
+Click V2 controllers are identified separately by Zwift manufacturer ID `0x094a`
+and model `0x0a`/`0x0b`. Their shared proprietary service alone is insufficient.
+See [direct Click V2 support](zwift-click-v2.md).
+
+The application scans without OS service filters and post-filters candidates. Some devices
 do not advertise standard services, advertise only while awake/unpaired, or stop
-advertising while connected to another app. Those may not appear. Devices exposing
-only proprietary services, and unrelated nearby devices, are not listed.
+advertising while connected to another app. Those may not appear. Unrecognized proprietary devices need explicit name selection; unrelated nearby devices are not listed.
 
 IDs are random BikeBridge UUIDs retained for the daemon session. BLE addresses and
 platform IDs remain private; there is no cross-restart identity persistence yet.
@@ -63,9 +66,9 @@ records for the same physical peripheral; cross-adapter identity merging is defe
   `sudo apt-get install libdbus-1-dev pkg-config`). At runtime, BlueZ and the system
   D-Bus service must be available, with permission to scan. Check radio power and
   rfkill if discovery fails. The executable still needs the native D-Bus runtime.
-- **macOS:** grant Bluetooth permission to the terminal launching the executable.
-  Distribution as an app bundle needs an `NSBluetoothAlwaysUsageDescription` in
-  its Info.plist. App bundling is not included yet. See btleplug's
+- **macOS:** grant Bluetooth permission when prompted. The CLI embeds an
+  `NSBluetoothAlwaysUsageDescription` in its executable for `cargo run` and
+  standalone builds. App bundling is not included yet. See btleplug's
   [platform installation notes](https://github.com/deviceplug/btleplug#buildinstallation-notes-for-specific-platforms).
 
 `run --mock` never initializes the native backend and requires no radio or runtime
@@ -78,6 +81,33 @@ cover the standard service types and OpenBikeControl, identity/metadata behavior
 HTTP/WebSocket discovery. Linux/macOS CI is configured but has not been run here.
 
 ## Phase 3 (implemented: FTMS telemetry)
+
+### Manual selection and Cycling Power
+
+Use `run --device-name "Steele's Bike"` (repeatable), or `[bluetooth] device_names`
+in the config, for a peripheral that omits cycling services from advertisements.
+The scan includes matching OS/advertised names as unconnected, unclassified
+candidates. Select it with `connect --name "Steele's Bike"`; duplicate names require
+an ID. Case and curly apostrophes are normalized, but matching is not a substring
+search. The original ID-based commands remain supported.
+
+Connection first prefers readable FTMS features with notifying Indoor Bike Data.
+Otherwise it verifies readable Cycling Power Feature (`0x2A65`) and notifying
+Cycling Power Measurement (`0x2A63`) under Cycling Power Service (`0x1818`). Only
+then does a candidate become a `power_meter` with `power` and optional `cadence`
+capabilities. Other profiles are rejected and disconnected.
+
+Cycling Power cadence requires two crank samples; 16-bit counter wrap is handled.
+Unchanged crank counts report zero after three seconds of continued notifications.
+Missing data, counter resets, implausible cadence above 300 RPM, and intervals of
+64 seconds or more omit cadence until a fresh baseline is available. Reconnects
+reset the baseline. Speed and trainer control are not exposed by this driver.
+
+`node examples/javascript/trainer.mjs --name "Steele's Bike"` connects and prints
+measurements. The XDS-T901-0204 on macOS was inspected and delivered standard
+Cycling Power packets at rest; nonzero pedaling measurements remain unverified.
+
+### FTMS connection requirements
 
 Use `bikebridge connect <device-id>` or the Node `trainer.mjs` example to connect a
 discovered FTMS candidate. The daemon requires readable Fitness Machine Feature
@@ -141,5 +171,5 @@ Connect explicitly using the ordinary device commands. The connected bridge has
 `controller_input` capability and publishes normalized `input` events, which the
 recorder captures without special handling. Bridge identity aggregates its physical
 controllers; it does not identify each physical button source. No physical hardware
-has been validated here. Native proprietary Zwift/Di2/AXS pairing, network OpenBikeControl,
+has been validated here. Other native proprietary Zwift/Di2/AXS pairing, network OpenBikeControl,
 and certification are not implemented.

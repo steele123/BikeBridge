@@ -34,6 +34,21 @@ pub(crate) async fn device(
 pub(crate) async fn adapters(State(state): State<AppState>) -> Json<Vec<AdapterInfo>> {
     Json(state.adapters().await)
 }
+pub(crate) async fn nearby(
+    State(state): State<AppState>,
+) -> Json<Vec<bikebridge_core::NearbyDevice>> {
+    Json(state.nearby_devices().await)
+}
+pub(crate) async fn select_nearby(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ScanStatus>, (StatusCode, Json<Value>)> {
+    state
+        .select_nearby_device(id)
+        .await
+        .map(Json)
+        .map_err(scan_error)
+}
 
 pub(crate) async fn scan_start(
     State(state): State<AppState>,
@@ -47,6 +62,7 @@ pub(crate) async fn scan_stop(
 }
 fn scan_error(error: BridgeError) -> (StatusCode, Json<Value>) {
     let status = match error.code {
+        ErrorCode::InvalidValue | ErrorCode::InvalidCommand => StatusCode::BAD_REQUEST,
         ErrorCode::Timeout => StatusCode::GATEWAY_TIMEOUT,
         ErrorCode::Busy => StatusCode::TOO_MANY_REQUESTS,
         ErrorCode::DeviceNotFound => StatusCode::NOT_FOUND,
@@ -55,6 +71,23 @@ fn scan_error(error: BridgeError) -> (StatusCode, Json<Value>) {
         _ => StatusCode::SERVICE_UNAVAILABLE,
     };
     (status, Json(json!({"type":"error", "data":error})))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NameSelection {
+    name: String,
+}
+
+pub(crate) async fn select_name(
+    State(state): State<AppState>,
+    Json(selection): Json<NameSelection>,
+) -> Result<Json<ScanStatus>, (StatusCode, Json<Value>)> {
+    state
+        .select_device_name(selection.name)
+        .await
+        .map(Json)
+        .map_err(scan_error)
 }
 
 pub(crate) async fn connect(

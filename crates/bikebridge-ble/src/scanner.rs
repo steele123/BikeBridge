@@ -4,8 +4,8 @@ use crate::{
     registry::Registry,
 };
 use bikebridge_core::{
-    AdapterInfo, AdapterState, BridgeError, DeviceInfo, ErrorCode, Event, EventBus, Result,
-    SafetyLimits, ScanStatus, TrainerCommand,
+    AdapterInfo, AdapterState, BridgeError, DeviceInfo, ErrorCode, Event, EventBus, NearbyDevice,
+    Result, SafetyLimits, ScanStatus, TrainerCommand,
 };
 use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use tokio::sync::{RwLock, mpsc, oneshot};
@@ -25,6 +25,8 @@ pub struct DiscoverySnapshot {
     pub scan: ScanStatus,
     /// Cycling devices discovered during this daemon session.
     pub devices: Vec<DeviceInfo>,
+    /// Cached Bluetooth results, including unnamed and unsupported devices.
+    pub nearby: Vec<NearbyDevice>,
 }
 
 /// Cloneable discovery actor handle. Commands are serialized independently of API/device locks.
@@ -39,6 +41,8 @@ pub struct Scanner {
 }
 
 enum Operation {
+    SelectDevice(String),
+    SelectName(String),
     Refresh,
     Start,
     Stop,
@@ -55,6 +59,7 @@ struct Worker<B> {
     snapshot: Arc<RwLock<DiscoverySnapshot>>,
     bus: EventBus,
     registry: Registry,
+    nearby: HashMap<(String, String), NearbyDevice>,
     adapter_ids: HashMap<String, String>,
     selected: Option<String>,
     preferred_index: Option<usize>,
@@ -97,6 +102,7 @@ impl Scanner {
             snapshot: snapshot.clone(),
             bus,
             registry: Registry::default(),
+            nearby: HashMap::new(),
             adapter_ids: HashMap::new(),
             selected: None,
             preferred_index,
@@ -121,11 +127,15 @@ impl Scanner {
                         let Some(request) = request else { break; };
                         if request.reply.is_closed() { continue; }
                         let result = match request.operation {
+                            Operation::SelectDevice(id) => worker.select_device(id).await,
+                            Operation::SelectName(name) => worker.select_name(name).await,
                             Operation::Refresh => worker.refresh().await,
                             Operation::Start => worker.start().await,
                             Operation::Stop => worker.stop().await,
                         };
-                        if let Err(error) = &result { worker.fail(error.clone()).await; }
+                        if let Err(error) = &result
+                            && !matches!(error.code, ErrorCode::DeviceNotFound | ErrorCode::InvalidValue | ErrorCode::UnsupportedOperation)
+                        { worker.fail(error.clone()).await; }
                         let status = worker.snapshot.read().await.scan.clone();
                         let _ = request.reply.send(result.map(|()| status));
                     }
@@ -215,6 +225,23 @@ impl Scanner {
     pub async fn start(&self) -> Result<ScanStatus> {
         self.request(Operation::Start).await
     }
+    /// Include a full Bluetooth name and restart discovery using an unfiltered scan.
+    pub async fn select_name(&self, name: String) -> Result<ScanStatus> {
+        if name.trim().is_empty()
+            || name.chars().count() > 128
+            || name.chars().any(char::is_control)
+        {
+            return Err(BridgeError::new(
+                ErrorCode::InvalidValue,
+                "Device names must contain 1–128 characters without control characters.",
+            ));
+        }
+        self.request(Operation::SelectName(name)).await
+    }
+    /// Include one cached nearby peripheral by its opaque selection ID, without connecting.
+    pub async fn select_device(&self, id: String) -> Result<ScanStatus> {
+        self.request(Operation::SelectDevice(id)).await
+    }
     /// Stop scanning, idempotently. Discovered device identities remain cached.
     pub async fn stop(&self) -> Result<ScanStatus> {
         self.request(Operation::Stop).await
@@ -264,6 +291,29 @@ async fn bounded<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
 }
 
 impl<B: DiscoveryBackend> Worker<B> {
+    async fn select_device(&mut self, id: String) -> Result<()> {
+        let (adapter, key) = self
+            .nearby
+            .iter()
+            .find_map(|(key, value)| {
+                (value.id == id && self.selected.as_ref() == Some(&key.0)).then(|| key.clone())
+            })
+            .ok_or_else(|| {
+                BridgeError::new(
+                    ErrorCode::DeviceNotFound,
+                    "Nearby device not found. Refresh Bluetooth results.",
+                )
+            })?;
+        self.backend.select_device(&adapter, &key)?;
+        self.start().await?;
+        self.poll().await;
+        Ok(())
+    }
+    async fn select_name(&mut self, name: String) -> Result<()> {
+        self.backend.select_name(name)?;
+        self.stop().await?;
+        self.start().await
+    }
     async fn refresh(&mut self) -> Result<()> {
         if self.snapshot.read().await.scan.scanning {
             return Ok(());
@@ -371,10 +421,54 @@ impl<B: DiscoveryBackend> Worker<B> {
             Ok(advertisements) => {
                 let mut events = Vec::new();
                 for advertisement in advertisements {
+                    let nearby_key = (key.clone(), advertisement.key.clone());
+                    if self.nearby.len() < 1024 || self.nearby.contains_key(&nearby_key) {
+                        let result =
+                            self.nearby
+                                .entry(nearby_key)
+                                .or_insert_with(|| NearbyDevice {
+                                    id: format!("nearby-{}", Uuid::new_v4()),
+                                    name: None,
+                                    signal_strength: None,
+                                    device_id: None,
+                                });
+                        if let Some(name) = advertisement
+                            .name
+                            .as_ref()
+                            .filter(|name| !name.trim().is_empty())
+                        {
+                            result.name =
+                                Some(name.chars().filter(|c| !c.is_control()).take(128).collect());
+                        }
+                        if advertisement.rssi.is_some() {
+                            result.signal_strength = advertisement.rssi;
+                        }
+                    }
                     if let Some(event) = self.registry.observe(key, advertisement) {
                         events.push(event);
                     }
                 }
+                let mut nearby = Vec::new();
+                for ((adapter, peripheral), result) in &mut self.nearby {
+                    if adapter == key {
+                        result.device_id = self.registry.device_id(adapter, peripheral);
+                        nearby.push(result.clone());
+                    }
+                }
+                nearby.sort_by(|a, b| {
+                    a.name
+                        .is_none()
+                        .cmp(&b.name.is_none())
+                        .then_with(|| {
+                            a.name
+                                .as_deref()
+                                .unwrap_or("")
+                                .to_lowercase()
+                                .cmp(&b.name.as_deref().unwrap_or("").to_lowercase())
+                        })
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                self.snapshot.write().await.nearby = nearby;
                 if !events.is_empty() {
                     for event in &mut events {
                         if let Event::DeviceDiscovered { data } | Event::DeviceUpdated { data } =
@@ -387,7 +481,12 @@ impl<B: DiscoveryBackend> Worker<B> {
                         }
                         if let Event::DeviceDiscovered { data } | Event::DeviceUpdated { data } =
                             event
-                            && data.kind == bikebridge_core::DeviceKind::Trainer
+                            && matches!(
+                                data.kind,
+                                bikebridge_core::DeviceKind::Trainer
+                                    | bikebridge_core::DeviceKind::PowerMeter
+                                    | bikebridge_core::DeviceKind::Unknown
+                            )
                             && let Some((adapter, key)) = self.registry.private_keys(&data.id)
                             && let Some(transport) = self.backend.peripheral(adapter, key)
                         {
@@ -397,7 +496,7 @@ impl<B: DiscoveryBackend> Worker<B> {
                     self.snapshot.write().await.devices = self.registry.devices();
                     for event in events {
                         if let Event::DeviceDiscovered { data } = &event {
-                            tracing::info!(device_id = %data.id, kind = ?data.kind, "Cycling device discovered");
+                            tracing::info!(device_id = %data.id, name = %data.name, kind = ?data.kind, "Cycling device candidate discovered");
                         }
                         if matches!(&event,Event::DeviceDiscovered {data} | Event::DeviceUpdated {data} if data.kind==bikebridge_core::DeviceKind::BikeController)
                         {

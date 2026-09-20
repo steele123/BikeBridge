@@ -1,7 +1,6 @@
 //! OpenBikeControl v1 button packets and edge normalization.
 //! Reference: OpenBikeControl/openbikecontrol-protocol, c057e1d7ad05ceb1a6d59a0ca95e57394b7f9b48.
 use bikebridge_core::{BikeInput, BridgeError, ErrorCode, InputData, InputState, Result};
-use std::collections::BTreeMap;
 
 /// Explicit actions advertised to BikeControl (its current implementation needs a nonempty list).
 pub const SUPPORTED_BUTTONS: &[u8] = &[
@@ -26,43 +25,40 @@ pub fn app_info() -> Vec<u8> {
 /// Maintains partial button updates, suppresses duplicate states, and clears held inputs on link loss.
 #[derive(Default)]
 pub struct Inputs {
-    states: BTreeMap<u8, InputData>,
+    states: Vec<InputData>,
 }
 impl Inputs {
     /// Parse one complete notification atomically. Preserve multiple transitions in wire order.
     pub fn packet(&mut self, bytes: &[u8]) -> Result<Vec<InputData>> {
-        if bytes.first() != Some(&1)
-            || bytes.len() < 3
-            || bytes.len() > 511
-            || bytes.len().is_multiple_of(2)
-        {
-            return Err(BridgeError::new(
-                ErrorCode::InvalidDeviceData,
-                "Malformed OpenBikeControl button notification.",
-            ));
-        }
-        let mut decoded = Vec::new();
-        for pair in bytes[1..].as_chunks::<2>().0 {
-            if !SUPPORTED_BUTTONS.contains(&pair[0]) {
-                continue;
-            }
-            if let Some(data) = decode(pair[0], pair[1])? {
-                decoded.push((pair[0], data));
-            }
+        self.update(decode_packet(bytes)?)
+    }
+    /// Apply validated partial updates from any controller transport, suppressing duplicates.
+    pub fn update(&mut self, decoded: Vec<InputData>) -> Result<Vec<InputData>> {
+        for data in &decoded {
+            data.validate()?;
         }
         let mut output = Vec::new();
-        for (id, data) in decoded {
-            if self.states.get(&id) != Some(&data) {
-                self.states.insert(id, data.clone());
-                output.push(data);
+        for data in decoded {
+            let current = self
+                .states
+                .iter_mut()
+                .find(|old| old.input == data.input && old.button == data.button);
+            if let Some(current) = current {
+                if *current == data {
+                    continue;
+                }
+                *current = data.clone();
+            } else {
+                self.states.push(data.clone());
             }
+            output.push(data);
         }
         Ok(output)
     }
     /// Synthetic releases prevent stuck buttons after disconnect; gear selections need no release.
     pub fn release_all(&mut self) -> Vec<InputData> {
         std::mem::take(&mut self.states)
-            .into_values()
+            .into_iter()
             .filter_map(|mut data| {
                 if data.input == BikeInput::Gear || data.state == InputState::Released {
                     return None;
@@ -80,6 +76,29 @@ impl Inputs {
             })
             .collect()
     }
+}
+/// Decode one complete OpenBikeControl notification without changing held state.
+pub fn decode_packet(bytes: &[u8]) -> Result<Vec<InputData>> {
+    if bytes.first() != Some(&1)
+        || bytes.len() < 3
+        || bytes.len() > 511
+        || bytes.len().is_multiple_of(2)
+    {
+        return Err(BridgeError::new(
+            ErrorCode::InvalidDeviceData,
+            "Malformed OpenBikeControl button notification.",
+        ));
+    }
+    let mut decoded = Vec::new();
+    for pair in bytes[1..].as_chunks::<2>().0 {
+        if !SUPPORTED_BUTTONS.contains(&pair[0]) {
+            continue;
+        }
+        if let Some(data) = decode(pair[0], pair[1])? {
+            decoded.push(data);
+        }
+    }
+    Ok(decoded)
 }
 fn decode(id: u8, state: u8) -> Result<Option<InputData>> {
     let input = match id {

@@ -13,8 +13,8 @@ Inputs and bridge disconnect/reconnect events are included in `.biketrace` recor
 The same bridge accepts mapped [Shimano Di2 and SRAM AXS inputs](di2-axs.md);
 that guide covers their pairing prerequisites and hardware-free demo traces.
 
-This implements a bridge integration, not native pairing to proprietary Zwift
-controller services, a Zwift game integration, or a Zwift-certified product.
+This guide covers the bridge integration. Experimental [direct Click V2 input](zwift-click-v2.md)
+is also implemented. Neither path is a Zwift game integration or Zwift-certified product.
 No physical Click, Play, or Ride has been tested with this implementation yet.
 
 ## Setup

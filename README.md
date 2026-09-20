@@ -42,6 +42,9 @@ cargo run -p bikebridge-cli -- run --mock
 ```
 
 The daemon listens at `http://127.0.0.1:9376` and `ws://127.0.0.1:9376/ws`.
+Open **[the dashboard](http://127.0.0.1:9376)** to view live telemetry, connect
+devices, operate supported trainer controls, and explore the HTTP/WebSocket API.
+The Svelte app is embedded in the executable; no separate web server is needed.
 Mock devices start connected with IDs `mock-trainer` and `mock-controller`.
 Stop with Ctrl+C (or SIGTERM on Unix).
 
@@ -101,6 +104,53 @@ Advertisements indicate a provisional role; capability lists stay empty until
 GATT features are verified on connection. No nearby device is automatically connected.
 A missing or powered-off adapter is
 reported in `/api/status` under `scan.lastError`; the API stays available.
+
+## Select a device by name
+
+Click **Browse Bluetooth** in the dashboard to search the Bluetooth names reported
+by nearby devices. Results include unknown devices, signal strength, and an optional
+**Show unnamed** filter. **Add device** selects that specific result, including when
+multiple devices share the same name. Then use **Connect** in Your devices.
+Browsing and adding do not connect automatically or imply protocol support.
+
+In the dashboard, click **Find by name**, enter the full Bluetooth display name,
+then click **Connect** when the device appears. This selection lasts for the
+current daemon session. To save a name across restarts, use the configuration below.
+
+For a bike that advertises no cycling services, include its full Bluetooth name:
+
+```sh
+cargo run -p bikebridge-cli -- run --device-name "Steele's Bike"
+# In another terminal, after the discovery message (Node.js 22+):
+node examples/javascript/trainer.mjs --name "Steele's Bike"
+```
+
+The viewer connects and prints available watts, RPM, and speed. Alternatively, use
+`cargo run -p bikebridge-cli -- connect --name "Steele's Bike"` to connect without
+opening a viewer. `disconnect --name` also works. Names match the whole display
+name, ignoring case, surrounding whitespace, and straight/curly apostrophes.
+Duplicate names require selecting the opaque ID from `devices` instead.
+
+Repeat `--device-name` for additional names, or save them as
+`device_names = ["Steele's Bike"]` under `[bluetooth]` in `bikebridge.toml`.
+Discovery scans without OS service filters and lists only recognized cycling
+devices, identified Click V2 controllers, and explicitly named candidates. Named candidates begin with an unknown
+role; connecting verifies their services. Names alone never grant capabilities.
+
+Cycling Power sensors stream watts and, when supported, cadence derived from
+crank revolutions. They do not provide FTMS resistance/ERG control or speed through
+this driver. XDS-T901-0204 was verified to connect and send Cycling Power packets
+on macOS; live pedaling accuracy remains to be checked.
+
+## Direct Click V2 buttons
+
+Wake your two Click V2 controllers and connect **Zwift Click V2 (left)** and
+**(right)** in the dashboard. Selecting one opens the live button monitor.
+Direct support is experimental and requires firmware that permits plaintext
+input; some versions need prior activation in the Zwift game. See
+[Click V2 setup and limitations](docs/zwift-click-v2.md). The existing BikeControl
+bridge remains supported. Buttons emit API inputs; they do not change trainer
+resistance automatically.
 
 ## Receive real trainer telemetry
 
@@ -295,10 +345,34 @@ can prevent cleanup writes. Physical fail-safe behavior remains unverified. Idle
 broken WebSockets are detected by ping/pong. Optional automatic trainer reconnection
 retries up to five times and never restores ownership or previous load targets.
 
-Only loopback addresses are supported. Browser `Origin` headers are rejected,
-including WebSocket upgrades; use native clients or Node.js. No CORS is enabled,
-and loopback Host headers are required. Local processes are trusted;
+Only loopback addresses are supported. Browser requests and WebSocket upgrades
+must have the exact same HTTP origin as the daemon; foreign origins are rejected.
+No CORS is enabled, and loopback Host headers are required. Local processes are trusted;
 there is no authentication or remote-access mode.
+
+## Dashboard development
+
+The Svelte 5 app lives in [`products/dashboard/`](products/dashboard/README.md). Its built assets are checked in
+so Rust builds work without Node.js. After frontend changes, run `bun run build`
+inside `products/dashboard/` and rebuild the daemon to embed the new assets. See the dashboard README
+for the development server and type checks.
+
+## Ride Along desktop companion
+
+[`products/ride-along/`](products/ride-along/README.md) is a Svelte + Tauri floating
+window for riding alongside YouTube or other apps. It displays live watts, cadence,
+speed, a power graph, and a local ride timer, with pin and compact-mode controls.
+Run BikeBridge first, then run `bun install` and `bun run desktop` in that product's
+directory. See its README for native prerequisites and packaging.
+
+## Stream overlay
+
+Open [Stream overlay](http://127.0.0.1:9376/overlay/) from the dashboard to configure
+an OBS Browser Source with live watts, cadence, speed, and optional heart rate.
+Choose a horizontal or stacked layout, copy its URL into OBS, and use the displayed
+source dimensions. The background is transparent; BikeBridge must remain running
+on the same computer as OBS. See [`products/stream-overlay/`](products/stream-overlay/README.md)
+for customization, development, and telemetry behavior.
 
 ## Project layout
 
@@ -306,6 +380,11 @@ there is no authentication or remote-access mode.
 .
 ├── Cargo.toml / Cargo.lock / rust-toolchain.toml
 ├── README.md / LICENSE / bikebridge.example.toml
+├── products/
+│   ├── README.md
+│   ├── dashboard/               # Svelte dashboard and embedded assets
+│   ├── ride-along/              # Svelte + Tauri floating ride companion
+│   └── stream-overlay/          # Svelte OBS overlay and embedded assets
 ├── crates/
 │   ├── bikebridge-core/src/
 │   │   ├── lib.rs / device.rs / discovery.rs / telemetry.rs / input.rs
@@ -336,6 +415,8 @@ events through Tokio's bounded broadcast channel, and exposes Axum endpoints.
 `ble` owns platform handles and serializes discovery operations in a separate task,
 so Bluetooth waits never hold the mock-device or API state locks.
 See [architecture](docs/architecture.md) for boundaries and lifecycle details.
+User-facing applications live under [`products/`](products/README.md), with one
+directory per product: the dashboard, Ride Along, and stream overlay.
 
 ## Tests and CI
 

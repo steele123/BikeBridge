@@ -19,7 +19,7 @@ const fn bluetooth_uuid(short: u16) -> Uuid {
     Uuid::from_u128(((short as u128) << 96) | 0x00001000800000805f9b34fb)
 }
 
-/// Services targeted by the scan filter, with post-filtering for platform differences.
+/// Known cycling and Zwift service UUIDs; Zwift model detection also requires manufacturer data.
 pub fn cycling_services() -> Vec<Uuid> {
     vec![
         FITNESS_MACHINE,
@@ -27,6 +27,8 @@ pub fn cycling_services() -> Vec<Uuid> {
         HEART_RATE,
         CYCLING_SPEED_CADENCE,
         OPEN_BIKE_CONTROL,
+        crate::click::SERVICE,
+        crate::click::LEGACY_SERVICE,
     ]
 }
 

@@ -2,6 +2,20 @@
 use crate::BridgeError;
 use serde::{Deserialize, Serialize};
 
+/// A Bluetooth scan result, including devices whose cycling support is unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NearbyDevice {
+    /// Opaque selection identity, scoped to this daemon session.
+    pub id: String,
+    /// Bluetooth display name, when supplied by the device or operating system.
+    pub name: Option<String>,
+    /// Cached received signal strength in dBm.
+    pub signal_strength: Option<i16>,
+    /// Corresponding cycling-device identity, after discovery or explicit selection.
+    pub device_id: Option<String>,
+}
+
 /// Platform-reported radio power state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

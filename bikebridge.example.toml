@@ -6,6 +6,8 @@ port = 9376
 [bluetooth]
 auto_scan = true
 # adapter_index = 0 # Optional zero-based override; otherwise prefer a powered-on radio.
+# Include named devices even when they advertise no cycling services. Does not auto-connect.
+# device_names = ["Steele's Bike"]
 
 [trainer]
 max_erg_watts = 800

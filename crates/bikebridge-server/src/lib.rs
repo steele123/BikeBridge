@@ -3,6 +3,7 @@ pub mod api;
 pub mod protocol;
 mod replay;
 pub mod state;
+mod ui;
 mod websocket;
 
 use axum::{
@@ -18,8 +19,8 @@ use std::{net::IpAddr, time::Duration};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-// Reject browser-origin requests in v1, including websocket handshakes, and guard
-// the Host header against DNS rebinding. Node/native clients send no Origin.
+// Only the dashboard's exact HTTP origin may use the browser API, including WS.
+// Validate Host independently to prevent DNS rebinding. Native clients omit Origin.
 async fn local_only(State(port): State<u16>, request: Request, next: Next) -> Response {
     let host_ok = request
         .headers()
@@ -32,9 +33,33 @@ async fn local_only(State(port): State<u16>, request: Request, next: Next) -> Re
                 || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()))
                 && authority.port_u16().unwrap_or(80) == port
         });
-    if request.headers().contains_key(header::ORIGIN) || !host_ok {
+    let origin_ok = match request.headers().get(header::ORIGIN) {
+        None => true,
+        Some(origin) => origin
+            .to_str()
+            .ok()
+            .and_then(|v| v.parse::<axum::http::Uri>().ok())
+            .is_some_and(|origin| {
+                origin.scheme_str() == Some("http")
+                    && origin
+                        .path_and_query()
+                        .is_none_or(|path| path.as_str() == "/")
+                    && origin.authority().is_some_and(|authority| {
+                        request
+                            .headers()
+                            .get(header::HOST)
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|host| authority.as_str().eq_ignore_ascii_case(host))
+                    })
+            }),
+    };
+    let cross_site = request
+        .headers()
+        .get("sec-fetch-site")
+        .is_some_and(|v| v == "cross-site");
+    if !origin_ok || !host_ok || cross_site {
         return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"type":"error", "data": {
-            "code":"access_denied", "message":"Use a native client with a loopback Host and no Origin header."
+            "code":"access_denied", "message":"Use the dashboard's exact loopback origin or a native client."
         }}))).into_response();
     }
     next.run(request).await
@@ -43,12 +68,22 @@ async fn local_only(State(port): State<u16>, request: Request, next: Next) -> Re
 /// Build the API router for a particular loopback listening port.
 pub fn router(state: AppState, port: u16) -> Router {
     Router::new()
+        .route("/", get(ui::index))
+        .route("/app.js", get(ui::javascript))
+        .route("/app.css", get(ui::stylesheet))
+        .route("/overlay", get(ui::overlay_index))
+        .route("/overlay/", get(ui::overlay_index))
+        .route("/overlay/app.js", get(ui::overlay_javascript))
+        .route("/overlay/app.css", get(ui::overlay_stylesheet))
         .route("/api/status", get(api::status))
         .route("/api/replay", get(api::replay_status))
         .route("/api/replay/{action}", post(api::replay_action))
         .route("/api/adapters", get(api::adapters))
         .route("/api/scan/start", post(api::scan_start))
         .route("/api/scan/stop", post(api::scan_stop))
+        .route("/api/scan/select", post(api::select_name))
+        .route("/api/scan/nearby", get(api::nearby))
+        .route("/api/scan/nearby/{id}/select", post(api::select_nearby))
         .route("/api/devices", get(api::devices))
         .route("/api/devices/{id}", get(api::device))
         .route("/api/devices/{id}/connect", post(api::connect))

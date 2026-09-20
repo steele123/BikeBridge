@@ -137,17 +137,25 @@ impl bikebridge_ble::DiscoveryBackend for DiscoveryFixture {
         &mut self,
         _: &str,
     ) -> bikebridge_core::Result<Vec<bikebridge_ble::Advertisement>> {
+        let manual = self.transport.as_ref().is_some_and(|t| t.cycling_power);
         Ok(vec![bikebridge_ble::Advertisement {
+            click_v2: None,
+            manually_selected: manual,
             key: "platform-private-device".into(),
             name: Some("Discovery Trainer".into()),
             rssi: Some(self.rssi.load(std::sync::atomic::Ordering::SeqCst)),
-            services: vec![bikebridge_ble::classification::FITNESS_MACHINE],
+            services: if manual {
+                vec![]
+            } else {
+                vec![bikebridge_ble::classification::FITNESS_MACHINE]
+            },
         }])
     }
 }
 
 #[derive(Default)]
 struct TelemetryFixture {
+    cycling_power: bool,
     control: bool,
     hold_response: std::sync::atomic::AtomicBool,
     control_sender: std::sync::Mutex<
@@ -207,8 +215,17 @@ impl bikebridge_ble::transport::FtmsTransport for TelemetryFixture {
                 None
             };
             Ok(bikebridge_ble::transport::FtmsSession {
+                format: if self.cycling_power {
+                    bikebridge_ble::transport::TelemetryFormat::CyclingPower
+                } else {
+                    bikebridge_ble::transport::TelemetryFormat::Ftms
+                },
                 control,
-                features: vec![2, 0x40, 0, 0, 255, 255, 255, 255],
+                features: if self.cycling_power {
+                    vec![8, 0, 0, 0]
+                } else {
+                    vec![2, 0x40, 0, 0, 255, 255, 255, 255]
+                },
                 notifications: Box::pin(futures_util::stream::unfold(
                     receiver,
                     |mut receiver| async { receiver.recv().await.map(|packet| (packet, receiver)) },
@@ -498,6 +515,23 @@ async fn scan_http_to_discovery_websocket_and_device_snapshot() {
     assert_eq!(discovery["data"]["connected"], false);
     assert_eq!(discovery["data"]["capabilities"], json!([]));
     assert!(!discovery.to_string().contains("platform-private"));
+    let (nearby_status, nearby) = daemon.request("GET", "/api/scan/nearby", &host, "").await;
+    assert_eq!(nearby_status, 200);
+    assert_eq!(nearby[0]["name"], "Discovery Trainer");
+    assert_eq!(nearby[0]["deviceId"], id);
+    assert!(!nearby.to_string().contains("platform-private"));
+    assert_eq!(
+        daemon
+            .request("POST", "/api/scan/nearby/unknown/select", &host, "")
+            .await
+            .0,
+        404
+    );
+    assert_eq!(
+        daemon.request("GET", "/api/status", &host, "").await.1["scan"]["lastError"],
+        Value::Null
+    );
+
     let (_, snapshot) = daemon.http(&format!("/api/devices/{id}"), &host, "").await;
     assert_eq!(snapshot, discovery["data"]);
     let (_, status) = daemon.http("/api/status", &host, "").await;
@@ -917,5 +951,141 @@ async fn graceful_close_is_acknowledged_and_observer_exit_keeps_owner_control() 
         response(&mut another, "denied").await["error"]["code"],
         "trainer_control_denied"
     );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn manually_selected_cycling_power_device_to_http_and_websocket() {
+    let transport = std::sync::Arc::new(TelemetryFixture {
+        cycling_power: true,
+        ..Default::default()
+    });
+    let (daemon, fixture, id) = telemetry_daemon(transport.clone()).await;
+    assert_eq!(
+        transport.opened.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "discovery must not connect automatically"
+    );
+    assert_eq!(
+        daemon.state.devices().await[0].kind,
+        bikebridge_core::DeviceKind::Unknown
+    );
+    let host = daemon.address.to_string();
+    let mut client = daemon.client().await;
+    send(
+        &mut client,
+        json!({"type":"subscribe", "requestId":"sub", "events":["telemetry", "device", "error"]}),
+    )
+    .await;
+    response(&mut client, "sub").await;
+    let (status, connected) = daemon
+        .request("POST", &format!("/api/devices/{id}/connect"), &host, "")
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(connected["kind"], "power_meter");
+    assert_eq!(connected["capabilities"], json!(["power", "cadence"]));
+    event(&mut client, "device.connected").await;
+    fixture.rssi.store(-65, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        event(&mut client, "device.updated").await["data"]["kind"],
+        "power_meter"
+    );
+    assert_eq!(
+        daemon.http("/api/devices", &host, "").await.1[0]["kind"],
+        "power_meter"
+    );
+    transport.packet(&[32, 0, 250, 0, 1, 0, 0, 4]).await;
+    assert_eq!(
+        event(&mut client, "telemetry").await["data"]["powerWatts"],
+        250
+    );
+    transport.packet(&[32, 0, 251, 0, 2, 0, 0, 8]).await;
+    let sample = event(&mut client, "telemetry").await;
+    assert_eq!(sample["data"]["cadenceRpm"], 60.0);
+    assert!(sample["data"].get("speedKph").is_none());
+    send(&mut client, json!({"type":"trainer.setTargetPower", "requestId":"control", "deviceId":id, "data":{"watts":250}})).await;
+    assert_eq!(
+        response(&mut client, "control").await["error"]["code"],
+        "unsupported_operation"
+    );
+    assert!(transport.writes.lock().expect("mutex").is_empty());
+    client.close(None).await.expect("close");
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn dashboard_assets_and_exact_same_origin_requests() {
+    let daemon = Daemon::start(true).await;
+    let host = daemon.address.to_string();
+    let origin = format!("Origin: http://{host}\r\n");
+    assert_eq!(daemon.http("/api/status", &host, &origin).await.0, 200);
+    for origin in [
+        "null".to_owned(),
+        "https://example.com".to_owned(),
+        format!("http://localhost:{}", daemon.address.port()),
+        format!("http://127.0.0.1:{}", daemon.address.port().wrapping_add(1)),
+        format!("https://{host}"),
+        format!("http://{host}/unexpected"),
+        format!("http://{host}.attacker.example"),
+    ] {
+        assert_eq!(
+            daemon
+                .http("/api/status", &host, &format!("Origin: {origin}\r\n"))
+                .await
+                .0,
+            403,
+            "{origin}"
+        );
+    }
+    assert_eq!(
+        daemon
+            .http("/api/status", &host, "Sec-Fetch-Site: cross-site\r\n")
+            .await
+            .0,
+        403
+    );
+    let mut request = format!("ws://{host}/ws")
+        .into_client_request()
+        .expect("request");
+    request
+        .headers_mut()
+        .insert("Origin", format!("http://{host}").parse().expect("origin"));
+    let (mut client, _) = connect_async(request).await.expect("same-origin websocket");
+    assert_eq!(next_json(&mut client).await["type"], "hello");
+    send(
+        &mut client,
+        json!({"type":"subscribe", "requestId":"web-sub", "events":["telemetry"]}),
+    )
+    .await;
+    assert_eq!(response(&mut client, "web-sub").await["success"], true);
+    assert_eq!(event(&mut client, "telemetry").await["type"], "telemetry");
+    client.close(None).await.expect("close");
+    for (path, content_type, content) in [
+        ("/", "text/html", "BikeBridge"),
+        ("/app.js", "text/javascript", "WebSocket"),
+        ("/app.css", "text/css", "sidebar"),
+        ("/overlay", "text/html", "/overlay/app.js"),
+        ("/overlay/", "text/html", "BikeBridge Stream Overlay"),
+        ("/overlay/?view=overlay", "text/html", "/overlay/app.css"),
+        ("/overlay/app.js", "text/javascript", "WebSocket"),
+        ("/overlay/app.css", "text/css", "broadcast"),
+    ] {
+        let mut stream = TcpStream::connect(daemon.address).await.expect("connect");
+        stream
+            .write_all(format!("GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n").as_bytes())
+            .await
+            .expect("request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("response");
+        let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP");
+        assert!(headers.contains("200 OK"));
+        assert!(headers.contains(content_type));
+        assert!(headers.contains("frame-ancestors 'none'"));
+        assert!(headers.contains("nosniff"));
+        assert!(body.contains(content), "missing {content} in {path}");
+    }
     daemon.stop().await;
 }

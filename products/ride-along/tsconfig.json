@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "target": "ES2022", "module": "ESNext", "moduleResolution": "bundler",
+    "allowJs": true, "checkJs": true, "strict": true, "esModuleInterop": true,
+    "skipLibCheck": true, "resolveJsonModule": true, "isolatedModules": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.svelte"],
+  "exclude": ["src/**/*.test.ts"]
+}

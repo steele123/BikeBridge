@@ -80,8 +80,9 @@ UUIDs; adapter labels are generic because btleplug does not expose portable mode
 names. While scanning, retained handles are used without re-enumerating adapters.
 
 Every second, the actor reads btleplug's advertisement-property cache. The backend
-applies service filters and the registry post-filters too, because OS filtering
-behavior differs. UUIDs in service-data keys also count as advertised services.
+scans without service filters so manufacturer-only Click V2 advertisements can
+be identified. The registry post-filters standard cycling services, Click V2 model
+IDs, and explicitly selected names. UUIDs in service-data keys also count as advertised services.
 Only cycling candidates are exposed. This snapshot-based discovery can coalesce
 intermediate RSSI/name changes; it is not a raw advertisement stream. Scan loss
 is detected when backend reads fail or report a powered-off radio. No platform

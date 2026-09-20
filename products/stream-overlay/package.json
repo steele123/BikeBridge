@@ -1,0 +1,5 @@
+{
+  "name": "bikebridge-stream-overlay", "version": "0.1.0", "private": true, "type": "module",
+  "scripts": { "dev": "vite --host 127.0.0.1", "build": "vite build", "check": "svelte-check --tsconfig ./tsconfig.json", "test": "bun test src/config.test.ts" },
+  "devDependencies": { "@sveltejs/vite-plugin-svelte": "^7.3.0", "svelte": "^5.57.1", "svelte-check": "^4.7.6", "typescript": "~6", "vite": "^8.3.0" }
+}

@@ -1,7 +1,7 @@
 use crate::{
     control::{decode_response, invalid, unsupported},
     ftms::RecordAssembler,
-    transport::{ControlEvent, FtmsSession, FtmsTransport},
+    transport::{ControlEvent, FtmsSession, FtmsTransport, TelemetryFormat},
 };
 use bikebridge_core::{
     BridgeError, ErrorCode, Event, EventBus, Result, SafetyLimits, TrainerCommand, timestamp_ms,
@@ -20,6 +20,7 @@ pub(crate) struct ActiveSession {
     resistance: Option<f32>,
     last_resistance: Instant,
     assembler: RecordAssembler,
+    power_decoder: crate::cycling_power::Decoder,
     last_parse_error: Option<Instant>,
     pub transport: Arc<dyn FtmsTransport>,
     pub bus: EventBus,
@@ -61,12 +62,20 @@ impl ActiveSession {
             resistance: None,
             last_resistance: Instant::now(),
             assembler: RecordAssembler::default(),
+            power_decoder: crate::cycling_power::Decoder::default(),
             last_parse_error: None,
         }
     }
     pub fn telemetry(&mut self, bytes: &[u8]) {
         let now = Instant::now();
-        match self.assembler.push(bytes, now, timestamp_ms()) {
+        let decoded = match self.io.format {
+            TelemetryFormat::Ftms => self.assembler.push(bytes, now, timestamp_ms()),
+            TelemetryFormat::CyclingPower => self
+                .power_decoder
+                .decode(bytes, now, timestamp_ms())
+                .map(Some),
+        };
+        match decoded {
             Ok(Some(data)) => self.bus.publish(Event::Telemetry {
                 device_id: self.id.clone(),
                 data,

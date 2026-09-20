@@ -13,6 +13,11 @@ struct Entry {
 }
 
 impl Registry {
+    pub fn device_id(&self, adapter: &str, key: &str) -> Option<String> {
+        self.devices
+            .get(&(adapter.to_owned(), key.to_owned()))
+            .map(|entry| entry.info.id.clone())
+    }
     pub fn private_keys(&self, id: &str) -> Option<(&str, &str)> {
         self.devices
             .iter()
@@ -32,7 +37,11 @@ impl Registry {
     pub fn observe(&mut self, adapter: &str, advertisement: Advertisement) -> Option<Event> {
         let key = (adapter.to_owned(), advertisement.key);
         let is_new = !self.devices.contains_key(&key);
-        if is_new && classify(&advertisement.services).is_none() {
+        if is_new
+            && advertisement.click_v2.is_none()
+            && !advertisement.manually_selected
+            && classify(&advertisement.services).is_none()
+        {
             return None;
         }
         // Bound our own discovery registry; btleplug maintains its platform cache separately.
@@ -61,8 +70,14 @@ impl Registry {
         if let Some(kind) = classify(&entry.services.iter().copied().collect::<Vec<_>>()) {
             entry.info.kind = kind;
         }
+        if advertisement.click_v2.is_some() {
+            entry.info.kind = bikebridge_core::DeviceKind::BikeController;
+        }
         if let Some(name) = advertisement.name.filter(|name| !name.trim().is_empty()) {
             entry.info.name = name.chars().filter(|c| !c.is_control()).take(128).collect();
+        }
+        if let Some(side) = advertisement.click_v2 {
+            entry.info.name = side.label().to_owned();
         }
         if let Some(rssi) = advertisement.rssi {
             entry.info.signal_strength = Some(rssi);
@@ -88,11 +103,41 @@ mod tests {
     use crate::classification::*;
     fn ad(services: Vec<Uuid>) -> Advertisement {
         Advertisement {
+            click_v2: None,
+            manually_selected: false,
             key: "AA:BB:CC:DD:EE:FF".into(),
             name: None,
             rssi: Some(-50),
             services,
         }
+    }
+    #[test]
+    fn click_manufacturer_identity_survives_partial_advertisements() {
+        let mut registry = Registry::default();
+        // The same proprietary service is used by non-controller products.
+        assert!(
+            registry
+                .observe("adapter", ad(vec![crate::click::SERVICE]))
+                .is_none()
+        );
+        let mut click = ad(vec![]);
+        click.click_v2 = Some(crate::click::Side::Left);
+        let event = registry
+            .observe("adapter", click)
+            .expect("Click discovered without service UUIDs");
+        assert!(matches!(event, Event::DeviceDiscovered { .. }));
+        assert_eq!(
+            registry.devices()[0].kind,
+            bikebridge_core::DeviceKind::BikeController
+        );
+        assert!(registry.devices()[0].capabilities.is_empty());
+        let id = registry.devices()[0].id.clone();
+        registry.observe("adapter", ad(vec![crate::click::LEGACY_SERVICE]));
+        assert_eq!(registry.devices()[0].id, id);
+        assert_eq!(
+            registry.devices()[0].kind,
+            bikebridge_core::DeviceKind::BikeController
+        );
     }
     #[test]
     fn identity_deduplication_updates_and_partial_advertisements() {

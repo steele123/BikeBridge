@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 
 #[derive(Default)]
 struct State {
+    selected_names: Vec<String>,
     adapters: Vec<BackendAdapter>,
     advertisements: Vec<Advertisement>,
     starts: Vec<String>,
@@ -22,6 +23,24 @@ fn failure() -> BridgeError {
     BridgeError::new(ErrorCode::ScanFailed, "Injected failure.")
 }
 impl DiscoveryBackend for Fake {
+    fn select_device(&mut self, _: &str, key: &str) -> Result<()> {
+        let mut state = self.0.try_lock().expect("uncontended fixture");
+        state
+            .advertisements
+            .iter_mut()
+            .find(|ad| ad.key == key)
+            .expect("known key")
+            .manually_selected = true;
+        Ok(())
+    }
+    fn select_name(&mut self, name: String) -> Result<()> {
+        self.0
+            .try_lock()
+            .expect("uncontended fixture")
+            .selected_names
+            .push(name);
+        Ok(())
+    }
     async fn adapters(&mut self) -> Result<Vec<BackendAdapter>> {
         Ok(self.0.lock().await.adapters.clone())
     }
@@ -64,6 +83,8 @@ fn adapter(key: &str, state: AdapterState) -> BackendAdapter {
 }
 fn advertisement() -> Advertisement {
     Advertisement {
+        click_v2: None,
+        manually_selected: false,
         key: "private-peripheral-address".into(),
         name: Some("Test Trainer".into()),
         rssi: Some(-52),
@@ -229,5 +250,149 @@ async fn poll_failure_stops_scan_and_emits_error_without_spinning() {
     tokio::time::advance(Duration::from_secs(30)).await;
     assert_eq!(fake.0.lock().await.starts.len(), 1);
     assert_eq!(fake.0.lock().await.stops, 1);
+    scanner.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn manual_selection_includes_only_opted_in_unknown_devices() {
+    let fake = powered().await;
+    let mut selected = advertisement();
+    selected.name = Some("Steele’s Bike".into());
+    selected.services.clear();
+    selected.manually_selected = true;
+    let mut unrelated = selected.clone();
+    unrelated.key = "unrelated-device".into();
+    unrelated.name = Some("TV".into());
+    unrelated.manually_selected = false;
+    fake.0.lock().await.advertisements = vec![selected, unrelated];
+    let bus = EventBus::default();
+    let mut events = bus.subscribe();
+    let scanner = Scanner::spawn(fake, bus, None).await;
+    scanner.start().await.expect("scan");
+    let device = next_device(&mut events).await;
+    assert_eq!(device.name, "Steele’s Bike");
+    assert_eq!(device.kind, bikebridge_core::DeviceKind::Unknown);
+    assert!(!device.connected);
+    assert!(device.capabilities.is_empty());
+    assert_eq!(scanner.snapshot().await.devices.len(), 1);
+    scanner.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn selecting_name_restarts_scan_and_rejects_invalid_names_before_mutation() {
+    let fake = powered().await;
+    let scanner = Scanner::spawn(fake.clone(), EventBus::default(), None).await;
+    scanner.start().await.expect("start");
+    for name in [
+        "".to_owned(),
+        "  ".to_owned(),
+        "a".repeat(129),
+        "bad\nname".to_owned(),
+    ] {
+        assert_eq!(
+            scanner
+                .select_name(name)
+                .await
+                .expect_err("invalid name")
+                .code,
+            ErrorCode::InvalidValue
+        );
+    }
+    assert!(fake.0.lock().await.selected_names.is_empty());
+    assert!(
+        scanner
+            .select_name("Steele's Bike".into())
+            .await
+            .expect("select")
+            .scanning
+    );
+    {
+        let state = fake.0.lock().await;
+        assert_eq!(state.selected_names, vec!["Steele's Bike"]);
+        assert_eq!(state.starts.len(), 2);
+        assert_eq!(state.stops, 1);
+    }
+    scanner.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn nearby_names_are_separate_and_selection_uses_identity_not_duplicate_name() {
+    let fake = powered().await;
+    let mut first = advertisement();
+    first.services.clear();
+    first.name = Some("Same name".into());
+    let mut second = first.clone();
+    second.key = "second-private-address".into();
+    let mut unnamed = first.clone();
+    unnamed.key = "third-private-address".into();
+    unnamed.name = None;
+    fake.0.lock().await.advertisements = vec![first, second, unnamed];
+    let scanner = Scanner::spawn(fake.clone(), EventBus::default(), None).await;
+    scanner.start().await.expect("scan");
+    let snapshot = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let snapshot = scanner.snapshot().await;
+            if snapshot.nearby.len() == 3 {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("nearby results");
+    assert!(snapshot.devices.is_empty());
+    assert_eq!(
+        snapshot
+            .nearby
+            .iter()
+            .filter(|d| d.name.as_deref() == Some("Same name"))
+            .count(),
+        2
+    );
+    assert!(snapshot.nearby.iter().any(|d| d.name.is_none()));
+    assert!(snapshot.nearby.iter().all(|d| d.device_id.is_none()));
+    let json = serde_json::to_string(&snapshot.nearby).expect("JSON");
+    assert!(!json.contains("private"));
+    let chosen = snapshot.nearby[0].id.clone();
+    scanner.select_device(chosen.clone()).await.expect("select");
+    let selected = scanner.snapshot().await;
+    assert_eq!(selected.devices.len(), 1);
+    assert!(!selected.devices[0].connected);
+    assert!(selected.devices[0].capabilities.is_empty());
+    assert_eq!(
+        selected
+            .nearby
+            .iter()
+            .filter(|d| d.device_id.is_some())
+            .count(),
+        1
+    );
+    assert_eq!(
+        selected
+            .nearby
+            .iter()
+            .find(|d| d.id == chosen)
+            .expect("same identity")
+            .device_id
+            .as_deref(),
+        Some(selected.devices[0].id.as_str())
+    );
+    assert_eq!(
+        scanner
+            .select_device("missing".into())
+            .await
+            .expect_err("bad ID")
+            .code,
+        ErrorCode::DeviceNotFound
+    );
+    assert!(scanner.snapshot().await.scan.scanning);
+    assert!(scanner.snapshot().await.scan.last_error.is_none());
+    scanner.stop().await.expect("stop");
+    assert_eq!(scanner.snapshot().await.nearby, selected.nearby);
+    scanner
+        .select_device(chosen)
+        .await
+        .expect("restart and select idempotently");
+    assert_eq!(scanner.snapshot().await.devices.len(), 1);
     scanner.shutdown().await;
 }

@@ -1,12 +1,29 @@
 // Node.js 22+. Start `bikebridge run`, then copy an ID from `bikebridge devices`.
 // Usage: node examples/javascript/trainer.mjs <device-id> [http://127.0.0.1:9376]
-const deviceId = process.argv[2];
-if (!deviceId) {
-  console.error("Usage: node examples/javascript/trainer.mjs <device-id> [http://127.0.0.1:9376]");
+// Or: node examples/javascript/trainer.mjs --name "Steele's Bike" [http://127.0.0.1:9376]
+const byName = process.argv[2] === "--name";
+const selection = process.argv[byName ? 3 : 2];
+if (!selection?.trim()) {
+  console.error("Usage: node examples/javascript/trainer.mjs <device-id> | --name <device-name> [http://127.0.0.1:9376]");
   console.error("Run `bikebridge devices` to find your trainer's ID.");
   process.exit(1);
 }
-const base = new URL(process.argv[3] ?? "http://127.0.0.1:9376");
+const base = new URL(process.argv[byName ? 4 : 3] ?? "http://127.0.0.1:9376");
+let deviceId = selection;
+if (byName) {
+  try {
+    const response = await fetch(new URL("/api/devices", base), {signal: AbortSignal.timeout(5000)});
+    if (!response.ok) throw new Error(`Device lookup failed: HTTP ${response.status}`);
+    const normalize = name => name.trim().replace(/[‘’]/g, "'").toLowerCase();
+    const matches = (await response.json()).filter(device => normalize(device.name) === normalize(selection));
+    if (matches.length === 0) throw new Error(`No device named ${JSON.stringify(selection)}. Start the daemon with --device-name ${JSON.stringify(selection)}, wake the bike, and wait for discovery.`);
+    if (matches.length > 1) throw new Error("Multiple devices have this name. Use a device ID from `bikebridge devices`.");
+    deviceId = matches[0].id;
+  } catch (error) {
+    console.error(error.message);
+    process.exit(1);
+  }
+}
 const wsUrl = new URL("/ws", base);
 wsUrl.protocol = base.protocol === "https:" ? "wss:" : "ws:";
 const socket = new WebSocket(wsUrl);

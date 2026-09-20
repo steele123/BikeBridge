@@ -1,5 +1,5 @@
-//! Injectable FTMS transport. Raw GATT operations stay inside this crate.
-use crate::classification::FITNESS_MACHINE;
+//! Injectable FTMS/Cycling Power transport. Raw GATT operations stay inside this crate.
+use crate::classification::{CYCLING_POWER, FITNESS_MACHINE};
 use crate::control::ControlProfile;
 use bikebridge_core::{BridgeError, ErrorCode, Result};
 use btleplug::{
@@ -21,6 +21,19 @@ pub const MACHINE_STATUS: Uuid = Uuid::from_u128(0x00002ada_0000_1000_8000_00805
 pub const RESISTANCE_RANGE: Uuid = Uuid::from_u128(0x00002ad6_0000_1000_8000_00805f9b34fb);
 /// Supported Power Range (0x2AD8).
 pub const POWER_RANGE: Uuid = Uuid::from_u128(0x00002ad8_0000_1000_8000_00805f9b34fb);
+/// Cycling Power Measurement (0x2A63).
+pub const CYCLING_POWER_MEASUREMENT: Uuid = Uuid::from_u128(0x00002a63_0000_1000_8000_00805f9b34fb);
+/// Cycling Power Feature (0x2A65).
+pub const CYCLING_POWER_FEATURE: Uuid = Uuid::from_u128(0x00002a65_0000_1000_8000_00805f9b34fb);
+
+/// Verified measurement protocol for a connected cycling device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TelemetryFormat {
+    /// FTMS Indoor Bike Data and eight-byte Fitness Machine Feature.
+    Ftms,
+    /// Cycling Power Measurement and four-byte Cycling Power Feature.
+    CyclingPower,
+}
 
 /// Ordered control indications and machine-status notifications from a single receiver.
 pub enum ControlEvent {
@@ -39,11 +52,13 @@ pub struct ControlSession {
 
 /// A subscribed transport, with raw values confined to the BLE layer.
 pub struct FtmsSession {
+    /// Selects the decoder for features and notifications; CPS never enables FTMS control.
+    pub format: TelemetryFormat,
     /// Available only after subscribing to both control indications and machine status.
     pub control: Option<ControlSession>,
-    /// Eight-byte Fitness Machine Feature value.
+    /// Feature value for the verified measurement protocol.
     pub features: Vec<u8>,
-    /// Only Indoor Bike Data notifications; closing means the session was lost.
+    /// Only the selected measurement notifications; closing means the session was lost.
     pub notifications: BoxStream<'static, Vec<u8>>,
 }
 
@@ -58,7 +73,7 @@ pub trait FtmsTransport: Send + Sync + 'static {
             ))
         })
     }
-    /// Connect, discover FTMS characteristics, read features, and subscribe to Indoor Bike Data.
+    /// Verify FTMS or Cycling Power features and subscribe to the matching measurements.
     fn open(&self) -> BoxFuture<'_, Result<FtmsSession>>;
     /// Check the OS connection state, even if notifications have stopped.
     fn is_connected(&self) -> BoxFuture<'_, Result<bool>>;
@@ -78,7 +93,7 @@ fn connection_error(error: btleplug::Error) -> BridgeError {
 fn unsupported() -> BridgeError {
     BridgeError::new(
         ErrorCode::UnsupportedOperation,
-        "Device must provide readable FTMS features and notifying Indoor Bike Data.",
+        "Device must provide readable FTMS or Cycling Power features and matching measurement notifications.",
     )
 }
 
@@ -109,6 +124,47 @@ impl FtmsTransport for NativeTransport {
             }
             self.0.discover_services().await.map_err(connection_error)?;
             let characteristics = self.0.characteristics();
+            let ftms_available = characteristics.iter().any(|c| {
+                c.service_uuid == FITNESS_MACHINE
+                    && c.uuid == FITNESS_MACHINE_FEATURE
+                    && c.properties.contains(CharPropFlags::READ)
+            }) && characteristics.iter().any(|c| {
+                c.service_uuid == FITNESS_MACHINE
+                    && c.uuid == INDOOR_BIKE_DATA
+                    && c.properties.contains(CharPropFlags::NOTIFY)
+            });
+            if !ftms_available {
+                let feature = characteristics
+                    .iter()
+                    .find(|c| {
+                        c.service_uuid == CYCLING_POWER
+                            && c.uuid == CYCLING_POWER_FEATURE
+                            && c.properties.contains(CharPropFlags::READ)
+                    })
+                    .ok_or_else(unsupported)?;
+                let data = characteristics
+                    .iter()
+                    .find(|c| {
+                        c.service_uuid == CYCLING_POWER
+                            && c.uuid == CYCLING_POWER_MEASUREMENT
+                            && c.properties.contains(CharPropFlags::NOTIFY)
+                    })
+                    .ok_or_else(unsupported)?;
+                let features = self.0.read(feature).await.map_err(connection_error)?;
+                crate::cycling_power::decode_features(&features)?;
+                let notifications = self.0.notifications().await.map_err(connection_error)?;
+                self.0.subscribe(data).await.map_err(connection_error)?;
+                return Ok(FtmsSession {
+                    format: TelemetryFormat::CyclingPower,
+                    control: None,
+                    features,
+                    notifications: notifications
+                        .filter_map(|event| async move {
+                            (event.uuid == CYCLING_POWER_MEASUREMENT).then_some(event.value)
+                        })
+                        .boxed(),
+                });
+            }
             let feature = characteristics
                 .iter()
                 .find(|c| {
@@ -192,6 +248,7 @@ impl FtmsTransport for NativeTransport {
                 })
                 .boxed();
             Ok(FtmsSession {
+                format: TelemetryFormat::Ftms,
                 control,
                 features,
                 notifications,

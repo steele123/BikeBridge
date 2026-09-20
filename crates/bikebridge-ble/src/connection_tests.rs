@@ -15,6 +15,7 @@ use std::sync::{
 
 #[derive(Default)]
 struct Fake {
+    cycling_power: AtomicBool,
     control_enabled: AtomicBool,
     reply_mode: AtomicUsize,
     emit_status: AtomicBool,
@@ -117,8 +118,15 @@ impl FtmsTransport for Fake {
                 None
             };
             Ok(FtmsSession {
+                format: if self.cycling_power.load(SeqCst) {
+                    TelemetryFormat::CyclingPower
+                } else {
+                    TelemetryFormat::Ftms
+                },
                 control,
-                features: if self.open_mode.load(SeqCst) == 3 {
+                features: if self.cycling_power.load(SeqCst) {
+                    vec![8, 0, 0, 0]
+                } else if self.open_mode.load(SeqCst) == 3 {
                     vec![0]
                 } else {
                     vec![2, 0x44, 0, 0, 255, 255, 255, 255]
@@ -362,5 +370,65 @@ async fn failed_teardown_is_visible_and_retried_before_open() {
         .await
         .expect("retry after recovery");
     assert_eq!(fake.opens.load(SeqCst), 2);
+    connections.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cycling_power_verifies_role_streams_telemetry_and_resets_on_reconnect() {
+    let (connections, fake, mut events) = fixture().await;
+    fake.cycling_power.store(true, SeqCst);
+    let info = connections
+        .set_connection("ble-fixture", true)
+        .await
+        .expect("connect CPS");
+    assert_eq!(info.kind, DeviceKind::PowerMeter);
+    assert_eq!(
+        info.capabilities,
+        vec![DeviceCapability::Power, DeviceCapability::Cadence]
+    );
+    assert!(matches!(
+        receive(&mut events).await,
+        Event::DeviceConnected { .. }
+    ));
+    let mut stale = device();
+    stale.kind = DeviceKind::Unknown;
+    connections.register(&stale, fake.clone()).await;
+    connections.overlay(&mut stale).await;
+    assert_eq!(stale.kind, DeviceKind::PowerMeter);
+    packet(&fake, &[32, 0, 250, 0, 1, 0, 0, 4]).await;
+    assert!(
+        matches!(receive(&mut events).await, Event::Telemetry {data, ..} if data.power_watts == Some(250) && data.cadence_rpm.is_none())
+    );
+    packet(&fake, &[32, 0, 251, 0, 2, 0, 0, 8]).await;
+    assert!(
+        matches!(receive(&mut events).await, Event::Telemetry {data, ..} if data.power_watts == Some(251) && data.cadence_rpm == Some(60.0) && data.speed_kph.is_none())
+    );
+    let error = connections
+        .execute(1, "ble-fixture", TrainerCommand::SetTargetPower(250))
+        .await
+        .expect_err("CPS cannot control load");
+    assert_eq!(error.code, ErrorCode::UnsupportedOperation);
+    assert!(fake.writes.lock().expect("mutex").is_empty());
+    assert!(matches!(receive(&mut events).await, Event::Error { .. }));
+    connections
+        .set_connection("ble-fixture", false)
+        .await
+        .expect("disconnect");
+    assert!(matches!(
+        receive(&mut events).await,
+        Event::DeviceDisconnected { .. }
+    ));
+    connections
+        .set_connection("ble-fixture", true)
+        .await
+        .expect("reconnect");
+    assert!(matches!(
+        receive(&mut events).await,
+        Event::DeviceConnected { .. }
+    ));
+    packet(&fake, &[32, 0, 252, 0, 3, 0, 0, 12]).await;
+    assert!(
+        matches!(receive(&mut events).await, Event::Telemetry {data, ..} if data.cadence_rpm.is_none())
+    );
     connections.shutdown().await;
 }

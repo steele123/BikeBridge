@@ -19,12 +19,14 @@ pub(crate) struct Config {
 pub(crate) struct Bluetooth {
     pub auto_scan: bool,
     pub adapter_index: Option<usize>,
+    pub device_names: Vec<String>,
 }
 impl Default for Bluetooth {
     fn default() -> Self {
         Self {
             auto_scan: true,
             adapter_index: None,
+            device_names: Vec::new(),
         }
     }
 }
@@ -73,6 +75,16 @@ impl Config {
             bail!("Port must be between 1 and 65535.");
         }
         self.trainer.validate()?;
+        for name in &self.bluetooth.device_names {
+            if name.trim().is_empty()
+                || name.chars().count() > 128
+                || name.chars().any(char::is_control)
+            {
+                bail!(
+                    "Bluetooth device names must contain 1–128 characters without control characters."
+                );
+            }
+        }
         Ok(())
     }
 }

@@ -12,10 +12,17 @@ use std::sync::{
 
 #[derive(Default)]
 struct ControllerFixture {
+    click_side: Option<bikebridge_ble::click::Side>,
     connected: AtomicBool,
     sender: Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
 }
 impl ControllerTransport for ControllerFixture {
+    fn decode(&self, bytes: &[u8]) -> bikebridge_core::Result<Vec<bikebridge_core::InputData>> {
+        match self.click_side {
+            Some(side) => bikebridge_ble::click::decode(side, bytes),
+            None => bikebridge_openbikecontrol::protocol::decode_packet(bytes),
+        }
+    }
     fn open(&self) -> BoxFuture<'_, bikebridge_core::Result<BoxStream<'static, Vec<u8>>>> {
         Box::pin(async {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -60,10 +67,22 @@ impl bikebridge_ble::DiscoveryBackend for ControllerDiscovery {
         _: &str,
     ) -> bikebridge_core::Result<Vec<bikebridge_ble::Advertisement>> {
         Ok(vec![bikebridge_ble::Advertisement {
+            click_v2: self.fixture.click_side,
+            manually_selected: false,
             key: "private-controller".into(),
-            name: Some("BikeControl".into()),
+            name: Some(
+                self.fixture
+                    .click_side
+                    .map(|side| side.label())
+                    .unwrap_or("BikeControl")
+                    .into(),
+            ),
             rssi: Some(-50),
-            services: vec![SERVICE],
+            services: if self.fixture.click_side.is_some() {
+                vec![]
+            } else {
+                vec![SERVICE]
+            },
         }])
     }
 }
@@ -193,4 +212,117 @@ async fn controller_bytes_to_websocket_recording_and_replay_with_disconnect_rele
             .iter()
             .any(|e| matches!(e,Event::Input {data,..} if data.state==InputState::Released))
     );
+}
+
+#[tokio::test]
+async fn native_click_v2_discovery_websocket_edges_and_malformed_cleanup() {
+    use bikebridge_ble::click::Side;
+    for (side, pressed_frame, action) in [
+        (
+            Side::Left,
+            vec![0x23, 8, 0xff, 0xfb, 0xff, 0xff, 0x0f],
+            "shift_down",
+        ),
+        (
+            Side::Right,
+            vec![0x23, 8, 0xff, 0xbf, 0xff, 0xff, 0x0f],
+            "shift_up",
+        ),
+    ] {
+        let state = AppState::new(false, SafetyLimits::default()).expect("state");
+        let fixture = Arc::new(ControllerFixture {
+            click_side: Some(side),
+            ..Default::default()
+        });
+        let scanner = bikebridge_ble::Scanner::spawn(
+            ControllerDiscovery {
+                fixture: fixture.clone(),
+                base: DiscoveryFixture::default(),
+            },
+            state.events.clone(),
+            None,
+        )
+        .await;
+        scanner.start().await.expect("scan");
+        let device = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(device) = scanner.snapshot().await.devices.first() {
+                    break device.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("discovery");
+        assert_eq!(device.name, side.label());
+        assert_eq!(device.kind, bikebridge_core::DeviceKind::BikeController);
+        assert!(device.capabilities.is_empty());
+        let daemon = Daemon::with_state(state.with_scanner(scanner)).await;
+        let mut viewer = daemon.client().await;
+        send(
+            &mut viewer,
+            json!({"type":"subscribe","requestId":"s","events":["input","device","error"]}),
+        )
+        .await;
+        assert_eq!(response(&mut viewer, "s").await["success"], true);
+        send(
+            &mut viewer,
+            json!({"type":"device.connect","requestId":"c","deviceId":device.id}),
+        )
+        .await;
+        assert_eq!(
+            response(&mut viewer, "c").await["data"]["capabilities"],
+            json!(["controller_input"])
+        );
+        let sender = fixture
+            .sender
+            .lock()
+            .expect("mutex")
+            .as_ref()
+            .expect("connected")
+            .clone();
+        sender.send(pressed_frame.clone()).await.expect("press");
+        let mut first = Vec::new();
+        for _ in 0..5 {
+            first.push(event(&mut viewer, "input").await);
+        }
+        assert_eq!(
+            first
+                .iter()
+                .filter(|e| e["data"]["state"] == "pressed")
+                .count(),
+            1
+        );
+        assert_eq!(first[4]["data"]["input"], action);
+        assert_eq!(first[4]["data"]["state"], "pressed");
+        sender.send(pressed_frame.clone()).await.expect("repeat");
+        sender.send(vec![0x19, 8, 90]).await.expect("battery");
+        sender
+            .send(vec![0x23, 8, 0xff, 0xff, 0xff, 0xff, 0x0f])
+            .await
+            .expect("release");
+        let released = event(&mut viewer, "input").await;
+        assert_eq!(released["data"]["input"], action);
+        assert_eq!(released["data"]["state"], "released");
+        sender.send(pressed_frame).await.expect("press");
+        assert_eq!(
+            event(&mut viewer, "input").await["data"]["state"],
+            "pressed"
+        );
+        sender.send(vec![0x23, 8, 0x80]).await.expect("malformed");
+        assert_eq!(
+            event(&mut viewer, "error").await["data"]["code"],
+            "invalid_device_data"
+        );
+        assert_eq!(
+            event(&mut viewer, "input").await["data"]["state"],
+            "released"
+        );
+        assert_eq!(
+            event(&mut viewer, "device.disconnected").await["data"]["connected"],
+            false
+        );
+        assert!(!fixture.connected.load(SeqCst));
+        daemon.stop().await;
+    }
 }
