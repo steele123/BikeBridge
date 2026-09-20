@@ -4,6 +4,10 @@ A Svelte overlay for OBS and other streaming software with a Browser Source.
 BikeBridge embeds its compiled assets, so normal use needs no Node.js or separate
 frontend server.
 
+Use **Stream overlay** in the BikeBridge desktop app to start without a terminal.
+The [desktop bundle](../../docs/desktop-bundle.md) includes the local service and all
+products. The CLI instructions below remain useful for development.
+
 ## Use in OBS
 
 1. Run `cargo run -p bikebridge-cli -- run` from the repository root.
@@ -29,6 +33,16 @@ a setup preview; it is never enabled by the generated broadcast URL.
 
 OBS and BikeBridge must run on the same computer. Loopback browser-origin checks
 remain enabled. Remote streaming PCs and hosted browser overlays are not supported.
+
+## Separate heart-rate monitor
+
+Connect the monitor in the dashboard, select it under **Heart-rate source** in
+setup, and copy the updated URL into OBS. Selecting a monitor also enables the
+Heart rate metric. Bike power/cadence/speed and monitor BPM remain independent.
+**Use bike heart rate** restores the bike's embedded measurement. Explicitly
+selected monitors never silently fall back to the bike's BPM after data loss.
+The URL stores `heartSource` and `heartDevice`; names resolve across daemon restarts
+only when unique. The shared selection/freshness logic lives in `../shared/`.
 
 ## Telemetry behavior
 

@@ -310,6 +310,15 @@ speed or resistance. The initial crank sample establishes a baseline; unchanged
 counts report zero cadence after three seconds of continued notifications.
 Malformed packets use the same rate-limited `invalid_device_data` error policy.
 
+Heart Rate Service monitors use `kind: "heart_rate_monitor"` and verified
+`capabilities: ["heart_rate"]`. Their `telemetry` events contain `heartRateBpm`
+(unsigned 16-bit) and `timestampMs`, under the monitor's own `deviceId`. When a
+sensor supporting contact detection reports no/poor contact, a timestamp-only
+sample clears BPM. Energy and RR fields are validated but not exposed. Malformed
+notifications follow the same error throttling above. Trainer commands on these
+sensors return `unsupported_operation`. Apps combine sensor and bike events with
+independent freshness; the daemon does not merge identities. See [Heart Rate](heart-rate.md).
+
 ## Mock controls
 
 Override any subset of measurements:

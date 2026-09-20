@@ -14,7 +14,7 @@ explicitly injected inputs. Multiple clients can observe both simultaneously.
 
 MockTrainer implements the core `Trainer` trait. Safety ceilings apply to load
 commands, while `mock.setTelemetry` supplies development measurements only.
-Heart rate currently comes from the trainer; there is no separate mock HR monitor.
+Mock heart rate comes from the trainer. A [synthetic two-device replay](heart-rate.md#try-without-hardware) demonstrates a separate monitor.
 
 ## Phase 2 (implemented: BLE discovery)
 
@@ -81,6 +81,10 @@ cover the standard service types and OpenBikeControl, identity/metadata behavior
 HTTP/WebSocket discovery. Linux/macOS CI is configured but has not been run here.
 
 ## Phase 3 (implemented: FTMS telemetry)
+
+### Heart-rate monitors
+
+Standard BLE Heart Rate Service monitors can connect and emit `heartRateBpm` independently of a trainer. See [heart-rate setup, data handling, and replay demo](heart-rate.md).
 
 ### Manual selection and Cycling Power
 

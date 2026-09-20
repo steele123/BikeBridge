@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>BikeBridge uses Bluetooth to connect to your bike, heart-rate monitor, and cycling controllers.</string>
+  <key>NSBluetoothPeripheralUsageDescription</key>
+  <string>BikeBridge uses Bluetooth to connect to your cycling devices.</string>
+</dict>
+</plist>

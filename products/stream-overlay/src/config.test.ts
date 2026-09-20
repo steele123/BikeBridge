@@ -2,7 +2,7 @@ import { test, expect } from 'bun:test';
 import { readConfig, overlayUrl, resolveSource, freshSample, type Device } from './config';
 test('overlay URLs preserve names and settings without treating names as parameters', () => {
   const config = readConfig('?layout=stack&metrics=heart,power&unit=mph&label=0');
-  config.source = 'Steele’s Bike & trainer #1'; config.device = 'ble-123';
+  config.source = 'Steele’s Bike & trainer #1'; config.device = 'ble-123'; config.heartSource = 'Chest & arm'; config.heartDevice = 'hr-123';
   const url = new URL(overlayUrl('http://127.0.0.1:9376', config));
   expect(url.pathname).toBe('/overlay/'); expect(url.searchParams.get('view')).toBe('overlay');
   expect(readConfig(url.search)).toEqual(config);

@@ -485,6 +485,7 @@ impl<B: DiscoveryBackend> Worker<B> {
                                 data.kind,
                                 bikebridge_core::DeviceKind::Trainer
                                     | bikebridge_core::DeviceKind::PowerMeter
+                                    | bikebridge_core::DeviceKind::HeartRateMonitor
                                     | bikebridge_core::DeviceKind::Unknown
                             )
                             && let Some((adapter, key)) = self.registry.private_keys(&data.id)

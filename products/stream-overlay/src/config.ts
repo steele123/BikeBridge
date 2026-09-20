@@ -1,13 +1,13 @@
 export const metrics = ['power', 'cadence', 'speed', 'heart'] as const;
 export type Metric = typeof metrics[number];
-export type Config = { source: string; device: string; metrics: Metric[]; layout: 'bar' | 'stack'; theme: 'dark' | 'light'; accent: 'lime' | 'cyan' | 'orange' | 'pink'; unit: 'kph' | 'mph'; graph: boolean; label: boolean };
+export type Config = { source: string; device: string; heartSource: string; heartDevice: string; metrics: Metric[]; layout: 'bar' | 'stack'; theme: 'dark' | 'light'; accent: 'lime' | 'cyan' | 'orange' | 'pink'; unit: 'kph' | 'mph'; graph: boolean; label: boolean };
 export const accents = { lime: '#c8f786', cyan: '#73dcff', orange: '#ffc185', pink: '#efa3dd' };
 export function readConfig(search: string): Config {
   const query = new URLSearchParams(search);
   const selected = metrics.filter(metric => query.get('metrics')?.split(',').includes(metric));
   const accent = query.get('accent') ?? '';
   return {
-    source: query.get('source') ?? '', device: query.get('device') ?? '', metrics: selected.length ? selected : ['power', 'cadence', 'speed'],
+    source: query.get('source') ?? '', device: query.get('device') ?? '', heartSource: query.get('heartSource') ?? '', heartDevice: query.get('heartDevice') ?? '', metrics: selected.length ? selected : ['power', 'cadence', 'speed'],
     layout: query.get('layout') === 'stack' ? 'stack' : 'bar', theme: query.get('theme') === 'light' ? 'light' : 'dark',
     accent: Object.hasOwn(accents, accent) ? accent as Config['accent'] : 'lime', unit: query.get('unit') === 'mph' ? 'mph' : 'kph',
     graph: query.get('graph') !== '0', label: query.get('label') !== '0'

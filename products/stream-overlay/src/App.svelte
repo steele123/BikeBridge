@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Overlay from './Overlay.svelte';
+  import { isHeartSource, resolveHeartSource, readHeartRate } from '../../shared/heart-rate';
   import { readConfig, overlayUrl, resolveSource, freshSample, metrics, accents, type Metric, type Config, type Point } from './config';
   import { Feed, emptyFeed } from './feed';
   const dashboardUrl = import.meta.env.DEV ? 'http://127.0.0.1:9376/' : '/';
@@ -13,7 +14,14 @@
   let copied = $state(false);
   let copyError = $state('');
   let source = $derived(resolveSource(feed.devices, config));
-  let data = $derived(freshSample(source ? feed.samples[source.id] : undefined, feed.online, !!source?.connected, now));
+  let bikeData = $derived(freshSample(source ? feed.samples[source.id] : undefined, feed.online, !!source?.connected, now));
+  let heartSelection = $derived({ id: config.heartDevice, name: config.heartSource });
+  let heartSource = $derived(resolveHeartSource(feed.devices, heartSelection));
+  let heartCandidates = $derived(feed.devices.filter(isHeartSource));
+  let data = $derived.by(() => {
+    const heartRateBpm = readHeartRate(feed.devices, feed.samples, heartSelection, now, feed.online, bikeData?.heartRateBpm);
+    return bikeData || heartRateBpm !== undefined ? { ...bikeData, heartRateBpm } : undefined;
+  });
   let status = $derived(!feed.online ? 'OFFLINE' : !data ? 'WAITING' : feed.mode === 'demo' ? 'DEMO' : feed.mode === 'replay' ? 'REPLAY' : 'LIVE');
   let url = $derived(overlayUrl(location.origin, config));
   let name = $derived(source?.name ?? (config.source || 'Your bike'));
@@ -26,6 +34,11 @@
   function choose(id: string) {
     const device = feed.devices.find(item => item.id === id);
     config.device = device?.id ?? ''; config.source = device?.name ?? '';
+  }
+  function chooseHeart(id: string) {
+    const device = feed.devices.find(item => item.id === id);
+    config.heartDevice = device?.id ?? ''; config.heartSource = device?.name ?? '';
+    if (device && !config.metrics.includes('heart')) config.metrics = [...config.metrics, 'heart'];
   }
   function toggleMetric(metric: Metric, checked: boolean) {
     const chosen = new Set(config.metrics);
@@ -53,7 +66,8 @@
       <div class="intro"><div><span class="kicker">YOUR RIDE. ON AIR.</span><h1>Bring your ride to the stream.</h1><p>Live cycling stats, wherever your audience is watching.</p></div><span class="connection" class:online={feed.online}><i></i>{feed.online ? 'BikeBridge connected' : 'Connecting to BikeBridge'}</span></div>
       <div class="workspace">
         <aside class="controls">
-          <section><div class="section-label"><span>01</span><h2>Choose your bike</h2></div><label for="bike">Telemetry source</label><select id="bike" value={config.device} onchange={event => choose(event.currentTarget.value)}><option value="">Automatic · connected power source</option>{#if config.device && !feed.devices.some(device => device.id === config.device)}<option value={config.device}>{config.source || 'Saved device'} · unavailable</option>{/if}{#each feed.devices.filter(device => device.kind !== 'controller') as device}<option value={device.id}>{device.name}{device.connected ? '' : ' · disconnected'}</option>{/each}</select><p class="hint">Connect your bike in the <a href={dashboardUrl}>dashboard</a>. Choose a specific source to keep the same bike after a restart.</p></section>
+          <section><div class="section-label"><span>01</span><h2>Choose your bike</h2></div><label for="bike">Telemetry source</label><select id="bike" value={config.device} onchange={event => choose(event.currentTarget.value)}><option value="">Automatic · connected power source</option>{#if config.device && !feed.devices.some(device => device.id === config.device)}<option value={config.device}>{config.source || 'Saved device'} · unavailable</option>{/if}{#each feed.devices.filter(device => !['bike_controller', 'heart_rate_monitor'].includes(device.kind)) as device}<option value={device.id}>{device.name}{device.connected ? '' : ' · disconnected'}</option>{/each}</select><p class="hint">Connect your bike in the <a href={dashboardUrl}>dashboard</a>. Choose a specific source to keep the same bike after a restart.</p></section>
+          <section><label for="heart-source">Heart-rate source</label><select id="heart-source" value={heartSource?.id ?? config.heartDevice} onchange={event => chooseHeart(event.currentTarget.value)}><option value="">Use bike heart rate</option>{#if config.heartDevice && !heartSource}<option value={config.heartDevice}>{config.heartSource || 'Saved monitor'} · unavailable</option>{/if}{#each heartCandidates as device}<option value={device.id}>{device.name}{device.connected ? '' : ' · disconnected'}</option>{/each}</select><p class="hint">Connect your monitor in the dashboard, then select it here to combine its BPM with your bike’s power and speed.</p></section>
           <section><div class="section-label"><span>02</span><h2>Make it yours</h2></div><span class="field-label">Layout</span><div class="choices"><button class:selected={config.layout === 'bar'} onclick={() => config.layout = 'bar'} aria-pressed={config.layout === 'bar'}><span class="layout-icon">▤</span>Horizontal</button><button class:selected={config.layout === 'stack'} onclick={() => config.layout = 'stack'} aria-pressed={config.layout === 'stack'}><span class="layout-icon">▥</span>Stacked</button></div><span class="field-label">Metrics</span><div class="metric-options">{#each metrics as metric}<label><input type="checkbox" checked={config.metrics.includes(metric)} disabled={config.metrics.length === 1 && config.metrics.includes(metric)} onchange={event => toggleMetric(metric, event.currentTarget.checked)}/>{labels[metric]}</label>{/each}</div><div class="field-row"><div><label for="theme">Panel</label><select id="theme" bind:value={config.theme}><option value="dark">Dark</option><option value="light">Light</option></select></div><div><label for="unit">Speed unit</label><select id="unit" bind:value={config.unit}><option value="kph">km/h</option><option value="mph">mph</option></select></div></div><span class="field-label">Accent</span><div class="swatches">{#each Object.entries(accents) as [key, color]}<button style={`--swatch:${color}`} class:chosen={config.accent === key} onclick={() => config.accent = key as Config['accent']} aria-label={`${key} accent`} aria-pressed={config.accent === key} title={key}></button>{/each}</div><div class="toggles"><label><input type="checkbox" bind:checked={config.label}/>Show bike name</label><label><input type="checkbox" bind:checked={config.graph}/>Show power graph</label></div></section>
         </aside>
         <div class="right-column">

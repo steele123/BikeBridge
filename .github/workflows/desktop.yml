@@ -1,0 +1,56 @@
+name: Desktop installers
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Desktop (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            bundles: dmg
+          - os: windows-latest
+            bundles: nsis
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.16
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install frontend dependencies
+        run: |
+          bun install --frozen-lockfile --cwd products/dashboard
+          bun install --frozen-lockfile --cwd products/stream-overlay
+          bun install --frozen-lockfile --cwd products/ride-along
+      - name: Check and build all included products
+        working-directory: products/ride-along
+        run: |
+          bun run check
+          bun run test
+          bun run build:bundle
+      - name: Test desktop service lifecycle
+        run: cargo test --release --locked --manifest-path products/ride-along/src-tauri/Cargo.toml
+      - name: Build installer
+        working-directory: products/ride-along
+        run: bun run package -- --bundles ${{ matrix.bundles }} -- --locked
+      - name: Upload unsigned test installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: BikeBridge-desktop-unsigned-${{ runner.os }}-${{ runner.arch }}
+          if-no-files-found: error
+          path: |
+            products/ride-along/src-tauri/target/release/bundle/dmg/*.dmg
+            products/ride-along/src-tauri/target/release/bundle/nsis/*-setup.exe

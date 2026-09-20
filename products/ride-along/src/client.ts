@@ -21,6 +21,13 @@ export async function snapshot(port: number): Promise<Snapshot> {
 export async function connectDevice(port: number, id: string) {
   return native ? invoke('bridge_connect_device', { port, id }) : http(`/api/devices/${encodeURIComponent(id)}/connect`, 'POST');
 }
+export async function ensureService(): Promise<boolean> {
+  return native ? invoke('bridge_ensure_service') : false;
+}
+export async function openProduct(port: number, product: 'dashboard' | 'overlay') {
+  if (native) await invoke('bridge_open_product', { port, product });
+  else window.open(`http://127.0.0.1:9376/${product === 'overlay' ? 'overlay/' : ''}`, '_blank', 'noopener');
+}
 export class Stream {
   private stopped = false;
   private socket?: WebSocket;

@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test": "bun test src/session.test.ts",
+    "test": "bun test src/session.test.ts ../shared/heart-rate.test.ts",
     "build": "vite build",
+    "build:bundle": "bun run --cwd ../dashboard build && bun run --cwd ../stream-overlay build && bun run build",
     "tauri": "tauri",
     "desktop": "tauri dev",
     "package": "tauri build"

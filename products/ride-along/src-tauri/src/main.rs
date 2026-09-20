@@ -2,10 +2,18 @@
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::{sync::Mutex, time::Duration};
-#[cfg(target_os = "macos")]
+mod runtime;
+
+use std::{
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tauri::Manager;
 use tauri::{State, ipc::Channel};
+use tauri_plugin_opener::OpenerExt;
 use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Default)]
@@ -46,7 +54,7 @@ async fn request(port: u16, path: &str, post: bool) -> Result<Value, String> {
     .send()
     .await
     .map_err(|_| {
-        format!("BikeBridge is unavailable on port {port}. Start the daemon and try again.")
+        format!("BikeBridge is unavailable on port {port}. Open Settings and choose Retry.")
     })?;
     let status = response.status();
     let value: Value = response
@@ -175,10 +183,90 @@ fn bridge_subscribe(
     Ok(())
 }
 
+#[derive(Default)]
+struct Quitting(AtomicBool);
+
+#[tauri::command]
+async fn bridge_ensure_service(state: State<'_, runtime::Runtime>) -> Result<bool, String> {
+    state.ensure().await
+}
+
+#[tauri::command]
+fn bridge_open_product(app: tauri::AppHandle, port: u16, product: String) -> Result<(), String> {
+    let path = match product.as_str() {
+        "dashboard" => "/",
+        "overlay" => "/overlay/",
+        _ => return Err("Unknown BikeBridge product.".into()),
+    };
+    app.opener()
+        .open_url(format!("{}{path}", base(port)?), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+fn show_ride(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn quit(app: &tauri::AppHandle) {
+    if app.state::<Quitting>().0.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        app.state::<runtime::Runtime>().shutdown().await;
+        app.exit(0);
+    });
+}
+
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            show_ride(app)
+        }))
+        .plugin(tauri_plugin_opener::init())
         .manage(Bridge::default())
+        .manage(runtime::Runtime::default())
+        .manage(Quitting::default())
         .setup(|app| {
+            use tauri::{
+                menu::{Menu, MenuItem},
+                tray::TrayIconBuilder,
+            };
+            let ride = MenuItem::with_id(app, "ride", "Ride Along", true, None::<&str>)?;
+            let dashboard =
+                MenuItem::with_id(app, "dashboard", "Devices & dashboard", true, None::<&str>)?;
+            let overlay = MenuItem::with_id(app, "overlay", "Stream overlay", true, None::<&str>)?;
+            let exit = MenuItem::with_id(app, "quit", "Quit BikeBridge", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&ride, &dashboard, &overlay, &exit])?;
+            TrayIconBuilder::with_id("bikebridge")
+                .icon(app.default_window_icon().ok_or("Missing app icon")?.clone())
+                .tooltip("BikeBridge — cycling apps")
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "ride" => show_ride(app),
+                    "dashboard" | "overlay" => {
+                        if let Err(error) = bridge_open_product(
+                            app.clone(),
+                            runtime::PORT,
+                            event.id.as_ref().to_owned(),
+                        ) {
+                            eprintln!("{error}");
+                            show_ride(app);
+                        }
+                    }
+                    "quit" => quit(app),
+                    _ => {}
+                })
+                .build(app)?;
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // The UI also awaits ensure(), receiving any startup error with a Retry action.
+                let _ = handle.state::<runtime::Runtime>().ensure().await;
+            });
             #[cfg(target_os = "macos")]
             {
                 use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior as Behavior};
@@ -192,18 +280,33 @@ fn main() {
                 behavior.insert(Behavior::CanJoinAllSpaces | Behavior::FullScreenAuxiliary);
                 native.setCollectionBehavior(behavior);
             }
-            #[cfg(not(target_os = "macos"))]
-            let _ = app;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             bridge_snapshot,
             bridge_connect_device,
             bridge_subscribe,
-            bridge_stop
+            bridge_stop,
+            bridge_ensure_service,
+            bridge_open_product
         ])
-        .run(tauri::generate_context!())
-        .expect("Unable to start Ride Along");
+        .build(tauri::generate_context!())
+        .expect("Unable to start BikeBridge")
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { api, code, .. } if code != Some(0) => {
+                api.prevent_exit();
+                quit(app);
+            }
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => show_ride(app),
+            _ => {}
+        });
 }
 
 #[cfg(test)]

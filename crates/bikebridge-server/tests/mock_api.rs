@@ -146,6 +146,8 @@ impl bikebridge_ble::DiscoveryBackend for DiscoveryFixture {
             rssi: Some(self.rssi.load(std::sync::atomic::Ordering::SeqCst)),
             services: if manual {
                 vec![]
+            } else if self.transport.as_ref().is_some_and(|t| t.heart_rate) {
+                vec![bikebridge_ble::classification::HEART_RATE]
             } else {
                 vec![bikebridge_ble::classification::FITNESS_MACHINE]
             },
@@ -155,6 +157,7 @@ impl bikebridge_ble::DiscoveryBackend for DiscoveryFixture {
 
 #[derive(Default)]
 struct TelemetryFixture {
+    heart_rate: bool,
     cycling_power: bool,
     control: bool,
     hold_response: std::sync::atomic::AtomicBool,
@@ -215,13 +218,17 @@ impl bikebridge_ble::transport::FtmsTransport for TelemetryFixture {
                 None
             };
             Ok(bikebridge_ble::transport::FtmsSession {
-                format: if self.cycling_power {
+                format: if self.heart_rate {
+                    bikebridge_ble::transport::TelemetryFormat::HeartRate
+                } else if self.cycling_power {
                     bikebridge_ble::transport::TelemetryFormat::CyclingPower
                 } else {
                     bikebridge_ble::transport::TelemetryFormat::Ftms
                 },
                 control,
-                features: if self.cycling_power {
+                features: if self.heart_rate {
+                    vec![]
+                } else if self.cycling_power {
                     vec![8, 0, 0, 0]
                 } else {
                     vec![2, 0x40, 0, 0, 255, 255, 255, 255]
@@ -1088,4 +1095,106 @@ async fn dashboard_assets_and_exact_same_origin_requests() {
         assert!(body.contains(content), "missing {content} in {path}");
     }
     daemon.stop().await;
+}
+
+#[tokio::test]
+async fn heart_rate_monitor_discovery_connection_telemetry_and_reconnect() {
+    let transport = std::sync::Arc::new(TelemetryFixture {
+        heart_rate: true,
+        control: true,
+        ..Default::default()
+    });
+    let (daemon, _, id) = telemetry_daemon(transport.clone()).await;
+    let discovered = daemon.state.devices().await;
+    assert_eq!(
+        discovered[0].kind,
+        bikebridge_core::DeviceKind::HeartRateMonitor
+    );
+    assert!(discovered[0].capabilities.is_empty());
+    assert_eq!(
+        transport.opened.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    let host = daemon.address.to_string();
+    let mut client = daemon.client().await;
+    send(
+        &mut client,
+        json!({"type":"subscribe","requestId":"sub","events":["telemetry","device","error"]}),
+    )
+    .await;
+    response(&mut client, "sub").await;
+    let (status, connected) = daemon
+        .request("POST", &format!("/api/devices/{id}/connect"), &host, "")
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(connected["kind"], "heart_rate_monitor");
+    assert_eq!(connected["capabilities"], json!(["heart_rate"]));
+    event(&mut client, "device.connected").await;
+    for (packet, expected) in [
+        (vec![0, 142], 142),
+        (vec![0x19, 44, 1, 3, 0, 0, 4, 128, 3], 300),
+    ] {
+        transport.packet(&packet).await;
+        let sample = event(&mut client, "telemetry").await;
+        assert_eq!(sample["deviceId"], id);
+        assert_eq!(sample["data"]["heartRateBpm"], expected);
+        assert!(sample["data"]["timestampMs"].is_u64());
+        for field in ["powerWatts", "cadenceRpm", "speedKph"] {
+            assert!(sample["data"].get(field).is_none());
+        }
+    }
+    transport.packet(&[4, 180]).await;
+    assert!(
+        event(&mut client, "telemetry").await["data"]
+            .get("heartRateBpm")
+            .is_none(),
+        "contact loss clears BPM"
+    );
+    transport.packet(&[1, 142]).await;
+    assert_eq!(
+        event(&mut client, "error").await["data"]["code"],
+        "invalid_device_data"
+    );
+    transport.packet(&[6, 143]).await;
+    assert_eq!(
+        event(&mut client, "telemetry").await["data"]["heartRateBpm"],
+        143
+    );
+    send(&mut client, json!({"type":"trainer.setTargetPower","requestId":"control","deviceId":id,"data":{"watts":200}})).await;
+    assert_eq!(
+        response(&mut client, "control").await["error"]["code"],
+        "unsupported_operation"
+    );
+    assert!(transport.writes.lock().expect("mutex").is_empty());
+    assert_eq!(
+        daemon
+            .request("POST", &format!("/api/devices/{id}/disconnect"), &host, "")
+            .await
+            .0,
+        200
+    );
+    event(&mut client, "device.disconnected").await;
+    assert_eq!(
+        daemon
+            .request("POST", &format!("/api/devices/{id}/connect"), &host, "")
+            .await
+            .0,
+        200
+    );
+    event(&mut client, "device.connected").await;
+    transport.packet(&[0, 99]).await;
+    assert_eq!(
+        event(&mut client, "telemetry").await["data"]["heartRateBpm"],
+        99
+    );
+    client.close(None).await.expect("close viewer");
+    assert!(
+        daemon.state.devices().await[0].connected,
+        "viewer exit does not disconnect the sensor"
+    );
+    daemon.stop().await;
+    assert_eq!(
+        transport.closed.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
 }

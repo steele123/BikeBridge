@@ -74,6 +74,9 @@ impl ActiveSession {
                 .power_decoder
                 .decode(bytes, now, timestamp_ms())
                 .map(Some),
+            TelemetryFormat::HeartRate => {
+                crate::heart_rate::decode(bytes, timestamp_ms()).map(Some)
+            }
         };
         match decoded {
             Ok(Some(data)) => self.bus.publish(Event::Telemetry {
@@ -331,5 +334,8 @@ pub(crate) fn denied(message: &str) -> BridgeError {
     BridgeError::new(ErrorCode::TrainerControlDenied, message)
 }
 pub(crate) fn disconnected() -> BridgeError {
-    BridgeError::new(ErrorCode::DeviceDisconnected, "FTMS connection was lost.")
+    BridgeError::new(
+        ErrorCode::DeviceDisconnected,
+        "BLE telemetry connection was lost.",
+    )
 }

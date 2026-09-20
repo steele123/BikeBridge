@@ -4,6 +4,10 @@ User-facing applications built on BikeBridge's HTTP/WebSocket API live here,
 with one directory per product. The Rust daemon and hardware integrations remain
 in `crates/`; small API usage examples remain in `examples/`.
 
+The **BikeBridge desktop app** bundles these products and starts the service
+automatically. Its Tauri shell lives under `ride-along/`. See the
+[one-download packaging guide](../docs/desktop-bundle.md).
+
 ## Current products
 
 - [`dashboard/`](dashboard/README.md): device discovery, live telemetry, trainer

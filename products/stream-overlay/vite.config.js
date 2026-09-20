@@ -3,7 +3,7 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 export default defineConfig({
   base: '/overlay/', plugins: [svelte()],
   build: { rollupOptions: { output: { entryFileNames: 'app.js', assetFileNames: 'app.[ext]' } } },
-  server: { port: 1421, strictPort: true, proxy: {
+  server: { fs: { allow: ['..'] }, port: 1421, strictPort: true, proxy: {
     '/api': { target: 'http://127.0.0.1:9376', changeOrigin: true, configure: originProxy },
     '/ws': { target: 'ws://127.0.0.1:9376', ws: true, changeOrigin: true, configure: originProxy }
   } }

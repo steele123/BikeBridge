@@ -1,5 +1,5 @@
-//! Injectable FTMS/Cycling Power transport. Raw GATT operations stay inside this crate.
-use crate::classification::{CYCLING_POWER, FITNESS_MACHINE};
+//! Injectable FTMS/Cycling Power/Heart Rate transport. Raw GATT operations stay inside this crate.
+use crate::classification::{CYCLING_POWER, FITNESS_MACHINE, HEART_RATE};
 use crate::control::ControlProfile;
 use bikebridge_core::{BridgeError, ErrorCode, Result};
 use btleplug::{
@@ -26,6 +26,9 @@ pub const CYCLING_POWER_MEASUREMENT: Uuid = Uuid::from_u128(0x00002a63_0000_1000
 /// Cycling Power Feature (0x2A65).
 pub const CYCLING_POWER_FEATURE: Uuid = Uuid::from_u128(0x00002a65_0000_1000_8000_00805f9b34fb);
 
+/// Heart Rate Measurement (0x2A37).
+pub const HEART_RATE_MEASUREMENT: Uuid = Uuid::from_u128(0x00002a37_0000_1000_8000_00805f9b34fb);
+
 /// Verified measurement protocol for a connected cycling device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TelemetryFormat {
@@ -33,6 +36,8 @@ pub enum TelemetryFormat {
     Ftms,
     /// Cycling Power Measurement and four-byte Cycling Power Feature.
     CyclingPower,
+    /// Heart Rate Measurement; there is no mandatory feature characteristic.
+    HeartRate,
 }
 
 /// Ordered control indications and machine-status notifications from a single receiver.
@@ -52,11 +57,11 @@ pub struct ControlSession {
 
 /// A subscribed transport, with raw values confined to the BLE layer.
 pub struct FtmsSession {
-    /// Selects the decoder for features and notifications; CPS never enables FTMS control.
+    /// Selects the decoder for features and notifications; sensor formats never enable FTMS control.
     pub format: TelemetryFormat,
     /// Available only after subscribing to both control indications and machine status.
     pub control: Option<ControlSession>,
-    /// Feature value for the verified measurement protocol.
+    /// Feature value for the verified protocol; empty for Heart Rate.
     pub features: Vec<u8>,
     /// Only the selected measurement notifications; closing means the session was lost.
     pub notifications: BoxStream<'static, Vec<u8>>,
@@ -73,7 +78,7 @@ pub trait FtmsTransport: Send + Sync + 'static {
             ))
         })
     }
-    /// Verify FTMS or Cycling Power features and subscribe to the matching measurements.
+    /// Verify FTMS, Cycling Power, or Heart Rate services and subscribe to the matching measurements.
     fn open(&self) -> BoxFuture<'_, Result<FtmsSession>>;
     /// Check the OS connection state, even if notifications have stopped.
     fn is_connected(&self) -> BoxFuture<'_, Result<bool>>;
@@ -87,13 +92,13 @@ fn connection_error(error: btleplug::Error) -> BridgeError {
     tracing::debug!(%error, "BLE session operation failed");
     BridgeError::new(
         ErrorCode::ConnectionFailed,
-        "BLE session operation failed. Check that the trainer is awake and available; debug logs contain details.",
+        "BLE session operation failed. Check that the device is awake and available; debug logs contain details.",
     )
 }
 fn unsupported() -> BridgeError {
     BridgeError::new(
         ErrorCode::UnsupportedOperation,
-        "Device must provide readable FTMS or Cycling Power features and matching measurement notifications.",
+        "Device must provide FTMS, Cycling Power, or Heart Rate measurement notifications with the required service characteristics.",
     )
 }
 
@@ -133,6 +138,38 @@ impl FtmsTransport for NativeTransport {
                     && c.uuid == INDOOR_BIKE_DATA
                     && c.properties.contains(CharPropFlags::NOTIFY)
             });
+            let power_available = characteristics.iter().any(|c| {
+                c.service_uuid == CYCLING_POWER
+                    && c.uuid == CYCLING_POWER_FEATURE
+                    && c.properties.contains(CharPropFlags::READ)
+            }) && characteristics.iter().any(|c| {
+                c.service_uuid == CYCLING_POWER
+                    && c.uuid == CYCLING_POWER_MEASUREMENT
+                    && c.properties.contains(CharPropFlags::NOTIFY)
+            });
+            if !ftms_available && !power_available {
+                let data = characteristics
+                    .iter()
+                    .find(|c| {
+                        c.service_uuid == HEART_RATE
+                            && c.uuid == HEART_RATE_MEASUREMENT
+                            && c.properties.contains(CharPropFlags::NOTIFY)
+                    })
+                    .ok_or_else(unsupported)?;
+                // HRS needs only its notifying measurement, not a feature read or a control point.
+                let notifications = self.0.notifications().await.map_err(connection_error)?;
+                self.0.subscribe(data).await.map_err(connection_error)?;
+                return Ok(FtmsSession {
+                    format: TelemetryFormat::HeartRate,
+                    control: None,
+                    features: Vec::new(),
+                    notifications: notifications
+                        .filter_map(|event| async move {
+                            (event.uuid == HEART_RATE_MEASUREMENT).then_some(event.value)
+                        })
+                        .boxed(),
+                });
+            }
             if !ftms_available {
                 let feature = characteristics
                     .iter()

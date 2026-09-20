@@ -115,7 +115,7 @@ impl Connections {
             let entry = entries.get_mut(id).ok_or_else(|| {
                 BridgeError::new(
                     ErrorCode::UnsupportedOperation,
-                    "Only FTMS indoor bikes, Cycling Power sensors, or manually selected candidates can connect here.",
+                    "Only supported cycling sensors, trainers, or manually selected candidates can connect here.",
                 )
             })?;
             if entry.commands.is_none() {
@@ -259,7 +259,10 @@ struct WorkerContext {
 }
 impl WorkerContext {
     async fn open(&self) -> Result<ActiveSession> {
-        let io = bounded(10, self.transport.open()).await?;
+        let mut io = bounded(10, self.transport.open()).await?;
+        if io.format != TelemetryFormat::Ftms {
+            io.control = None;
+        }
         let (mut capabilities, kind) = match io.format {
             TelemetryFormat::Ftms => (
                 crate::ftms::decode_features(&io.features)?,
@@ -268,6 +271,10 @@ impl WorkerContext {
             TelemetryFormat::CyclingPower => (
                 crate::cycling_power::decode_features(&io.features)?,
                 bikebridge_core::DeviceKind::PowerMeter,
+            ),
+            TelemetryFormat::HeartRate => (
+                vec![bikebridge_core::DeviceCapability::HeartRate],
+                bikebridge_core::DeviceKind::HeartRateMonitor,
             ),
         };
         if let Some(control) = &io.control {

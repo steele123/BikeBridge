@@ -8,6 +8,7 @@ pub mod control;
 mod controller_transport;
 pub mod cycling_power;
 pub mod ftms;
+pub mod heart_rate;
 mod registry;
 mod scanner;
 mod session;

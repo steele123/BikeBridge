@@ -3,7 +3,7 @@ name = "ride-along"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "An always-on-top ride companion for BikeBridge"
+description = "BikeBridge desktop: Bluetooth, Ride Along, and stream overlay"
 
 # Desktop packaging has its own lockfile and native prerequisites.
 [workspace]
@@ -12,7 +12,13 @@ description = "An always-on-top ride companion for BikeBridge"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+bikebridge-server = { path = "../../../crates/bikebridge-server" }
+bikebridge-ble = { path = "../../../crates/bikebridge-ble" }
+bikebridge-core = { path = "../../../crates/bikebridge-core" }
+tokio-util = { version = "0.7", features = ["rt"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 tokio = { version = "1", features = ["time", "net", "sync", "macros"] }
