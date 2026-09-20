@@ -1,0 +1,18 @@
+# Copy to bikebridge.toml. CLI --host, --port, --log-level override these values.
+[server]
+host = "127.0.0.1"
+port = 9376
+
+[bluetooth]
+auto_scan = true
+# adapter_index = 0 # Optional zero-based override; otherwise prefer a powered-on radio.
+
+[trainer]
+max_erg_watts = 800
+max_grade_percent = 15.0
+max_resistance = 0.7
+max_resistance_change_per_second = 0.2
+smooth_resistance = true
+
+[logging]
+level = "info"
